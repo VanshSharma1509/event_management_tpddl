@@ -10,8 +10,8 @@ import io
 # ==========================================
 # CONFIG & CREDENTIALS
 # ==========================================
-ADMIN_USER = "Amit Sharma"
-ADMIN_PASS = "Ndpl@1234"
+ADMIN_USER = "barstock_tatapower"
+ADMIN_PASS = "amittpddl"
 
 # ==========================================
 # DATABASE SETUP & HELPERS
@@ -26,6 +26,18 @@ def init_db():
     conn = get_connection()
     c = conn.cursor()
     
+    # NEW Dynamic Locations Table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS LOCATIONS_TABLE (
+            location_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_name TEXT UNIQUE
+        )
+    ''')
+    
+    # Insert Default Locations if empty
+    c.execute("INSERT OR IGNORE INTO LOCATIONS_TABLE (location_name) VALUES ('Cenpeid Guest House')")
+    c.execute("INSERT OR IGNORE INTO LOCATIONS_TABLE (location_name) VALUES ('Civil Lines Guest House')")
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS STOCK_TABLE (
             stock_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,7 +53,8 @@ def init_db():
             bill_no TEXT,
             price REAL,
             supplier TEXT,
-            remarks TEXT
+            remarks TEXT,
+            location TEXT
         )
     ''')
     
@@ -60,7 +73,8 @@ def init_db():
             total_ml_after REAL,
             open_bottles_after INTEGER,
             closed_bottles_after INTEGER,
-            permit_number TEXT
+            permit_number TEXT,
+            location TEXT
         )
     ''')
     
@@ -84,15 +98,28 @@ def init_db():
             remarks TEXT,
             status TEXT,
             requested_by TEXT,
-            date TEXT
+            date TEXT,
+            location TEXT
         )
     ''')
     
-    # Safe migration for existing databases to add permit_number
-    try:
-        c.execute("ALTER TABLE EVENT_TABLE ADD COLUMN permit_number TEXT")
-    except sqlite3.OperationalError:
-        pass # Column already exists
+    # Safe migrations for existing databases to add columns if they don't exist
+    try: c.execute("ALTER TABLE EVENT_TABLE ADD COLUMN permit_number TEXT")
+    except sqlite3.OperationalError: pass
+    
+    try: c.execute("ALTER TABLE STOCK_TABLE ADD COLUMN location TEXT")
+    except sqlite3.OperationalError: pass
+        
+    try: c.execute("ALTER TABLE EVENT_TABLE ADD COLUMN location TEXT")
+    except sqlite3.OperationalError: pass
+        
+    try: c.execute("ALTER TABLE PENDING_STOCK_TABLE ADD COLUMN location TEXT")
+    except sqlite3.OperationalError: pass
+
+    # Cleanup legacy null locations
+    c.execute("UPDATE STOCK_TABLE SET location = 'Cenpeid Guest House' WHERE location IS NULL OR location = ''")
+    c.execute("UPDATE EVENT_TABLE SET location = 'Cenpeid Guest House' WHERE location IS NULL OR location = ''")
+    c.execute("UPDATE PENDING_STOCK_TABLE SET location = 'Cenpeid Guest House' WHERE location IS NULL OR location = ''")
         
     conn.commit()
     conn.close()
@@ -116,12 +143,18 @@ def fetch_data(query, params=()):
     conn.close()
     return df
 
+def get_active_locations():
+    df = fetch_data("SELECT location_name FROM LOCATIONS_TABLE ORDER BY location_id ASC")
+    if df.empty:
+        return ["Cenpeid Guest House"]
+    return df['location_name'].tolist()
+
 def get_template_excel(template_type):
     buffer = io.BytesIO()
     if template_type == 'stock':
-        df = pd.DataFrame(columns=['item', 'brand_name', 'ml_per_bottle', 'bottle_count', 'bill_no', 'date', 'price', 'supplier', 'remarks'])
+        df = pd.DataFrame(columns=['item', 'brand_name', 'location', 'ml_per_bottle', 'bottle_count', 'bill_no', 'date', 'price', 'supplier', 'remarks'])
     elif template_type == 'event':
-        df = pd.DataFrame(columns=['date', 'occasion', 'brand_name', 'bottles_consumed', 'extra_ml', 'permit_number'])
+        df = pd.DataFrame(columns=['date', 'occasion', 'brand_name', 'location', 'bottles_consumed', 'extra_ml', 'permit_number'])
     
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Template')
@@ -157,7 +190,8 @@ def rename_for_display(df):
         'item': 'Item',
         'bottle_count': 'Bottle Count',
         'status': 'Status',
-        'requested_by': 'Requested By'
+        'requested_by': 'Requested By',
+        'location': 'Location'
     }
     return df.rename(columns=mapping)
 
@@ -165,7 +199,7 @@ def rename_for_display(df):
 # CORE REUSABLE LOGIC
 # ==========================================
 
-def apply_consumption_logic(brand, ml_consumed):
+def apply_consumption_logic(brand, location, ml_consumed):
     if ml_consumed <= 0:
         return False, "Consumption amount must be greater than zero."
 
@@ -174,12 +208,12 @@ def apply_consumption_logic(brand, ml_consumed):
     
     try:
         stock_rows = pd.read_sql_query(
-            "SELECT * FROM STOCK_TABLE WHERE brand_name = ? AND total_ml_available > 0 ORDER BY date_added ASC", 
-            conn, params=(brand,)
+            "SELECT * FROM STOCK_TABLE WHERE brand_name = ? AND location = ? AND total_ml_available > 0 ORDER BY date_added ASC", 
+            conn, params=(brand, location)
         )
         
         if stock_rows.empty:
-            raise ValueError(f"No stock available for {brand}.")
+            raise ValueError(f"No stock available for {brand} at {location}.")
             
         total_ml_before = float(stock_rows['total_ml_available'].sum())
         total_closed_before = int(stock_rows['closed_bottles'].sum())
@@ -187,7 +221,7 @@ def apply_consumption_logic(brand, ml_consumed):
         total_bottles_before = total_closed_before + total_open_before
         
         if ml_consumed > total_ml_before:
-            raise ValueError(f"Insufficient stock for {brand}. Requested: {ml_consumed} ML, Available: {total_ml_before} ML.")
+            raise ValueError(f"Insufficient stock for {brand} at {location}. Requested: {ml_consumed} ML, Available: {total_ml_before} ML.")
             
         remaining_to_consume = float(ml_consumed)
         total_open_ml_used = 0.0
@@ -239,8 +273,8 @@ def apply_consumption_logic(brand, ml_consumed):
         conn.commit()
         
         after_df = pd.read_sql_query(
-            "SELECT SUM(closed_bottles) as c, SUM(open_bottles) as o FROM STOCK_TABLE WHERE brand_name = ?", 
-            conn, params=(brand,)
+            "SELECT SUM(closed_bottles) as c, SUM(open_bottles) as o FROM STOCK_TABLE WHERE brand_name = ? AND location = ?", 
+            conn, params=(brand, location)
         )
         total_closed_after = int(after_df.iloc[0]['c']) if pd.notna(after_df.iloc[0]['c']) else 0
         total_open_after = int(after_df.iloc[0]['o']) if pd.notna(after_df.iloc[0]['o']) else 0
@@ -270,57 +304,130 @@ def apply_consumption_logic(brand, ml_consumed):
 # PAGE FUNCTIONS
 # ==========================================
 
+def manage_locations():
+    st.title("📍 Manage Locations")
+    st.info("Dynamically add or remove locations. You cannot delete a location if it currently holds stock.")
+    
+    locations = get_active_locations()
+    
+    with st.form("add_loc_form", clear_on_submit=True):
+        st.subheader("Add New Location")
+        new_loc = st.text_input("Location Name")
+        if st.form_submit_button("Add Location", type="primary"):
+            if new_loc and new_loc.strip() != "":
+                clean_name = new_loc.strip()
+                try:
+                    conn = get_connection()
+                    c = conn.cursor()
+                    c.execute("INSERT INTO LOCATIONS_TABLE (location_name) VALUES (?)", (clean_name,))
+                    conn.commit()
+                    st.success(f"Added location: {clean_name}")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("This location name already exists.")
+                finally:
+                    conn.close()
+            else:
+                st.error("Location name cannot be empty.")
+                
+    st.markdown("---")
+    st.subheader("Active Locations")
+    
+    for loc in locations:
+        col1, col2 = st.columns([3, 1])
+        col1.write(f"🏢 **{loc}**")
+        
+        if col2.button("Delete", key=f"del_{loc}", use_container_width=True):
+            # Check if stock exists
+            stock_check = fetch_data("SELECT COUNT(*) as count FROM STOCK_TABLE WHERE location = ?", (loc,))
+            if stock_check.iloc[0]['count'] > 0:
+                st.error(f"Cannot delete '{loc}' because it has active stock entries. Please clear stock first.")
+            else:
+                run_query("DELETE FROM LOCATIONS_TABLE WHERE location_name = ?", (loc,))
+                st.success(f"Deleted location: {loc}")
+                st.rerun()
+
 def dashboard():
     st.title("📊 Dashboard Metrics")
     
+    locations = get_active_locations()
     stock_df = fetch_data("SELECT * FROM STOCK_TABLE")
+    events_df = fetch_data("SELECT * FROM EVENT_TABLE")
+    
     if stock_df.empty:
         st.info("No stock data available yet.")
         return
         
+    # A. Overall Metrics
+    st.markdown("### 🌍 Overall Inventory Summary")
     total_ml = stock_df['total_ml_available'].sum()
     total_bottles = stock_df['open_bottles'].sum() + stock_df['closed_bottles'].sum()
     
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Inventory (ML)", f"{total_ml:,.2f}")
-    col2.metric("Total Bottles", f"{total_bottles}")
+    col1.metric("Overall Total Inventory (ML)", f"{total_ml:,.2f}")
+    col2.metric("Overall Total Bottles", f"{total_bottles}")
     
-    events_df = fetch_data("SELECT brand_name, SUM(ml_consumed) as consumed FROM EVENT_TABLE GROUP BY brand_name ORDER BY consumed DESC")
     if not events_df.empty:
-        top_brand = events_df.iloc[0]['brand_name']
-        col3.metric("Most Consumed Brand", top_brand)
+        top_brand_df = events_df.groupby('brand_name')['ml_consumed'].sum().reset_index()
+        top_brand = top_brand_df.loc[top_brand_df['ml_consumed'].idxmax()]['brand_name']
+        col3.metric("Most Consumed Brand (Overall)", top_brand)
     else:
         col3.metric("Most Consumed Brand", "N/A")
 
     st.markdown("---")
-    colA, colB = st.columns(2)
     
-    with colA:
-        st.subheader("Inventory by Brand (ML)")
-        brand_stock = stock_df.groupby('brand_name')['total_ml_available'].sum().reset_index()
-        fig_pie = px.pie(brand_stock, names='brand_name', values='total_ml_available', hole=0.3)
-        st.plotly_chart(fig_pie, use_container_width=True)
+    # B. Location-wise Split
+    st.markdown("### 🏢 Location-wise Split")
+    
+    for loc in locations:
+        st.markdown(f"#### 📌 {loc}")
+        loc_stock = stock_df[stock_df['location'] == loc]
+        loc_events = events_df[events_df['location'] == loc] if not events_df.empty else pd.DataFrame()
         
-    with colB:
-        st.subheader("Low Stock Alert")
-        low_stock = brand_stock[brand_stock['total_ml_available'] < 1000]
-        if not low_stock.empty:
-            st.warning("The following brands have less than 1000 ML remaining:")
-            st.dataframe(low_stock.rename(columns={'brand_name':'Brand Name', 'total_ml_available': 'Total ML'}), hide_index=True)
-        else:
-            st.success("All brands have sufficient stock (>1000 ML).")
+        if loc_stock.empty:
+            st.info(f"No stock data for {loc}.")
+            continue
             
-    if not events_df.empty:
-        st.markdown("---")
-        st.subheader("Total Consumption per Brand")
-        fig_bar = px.bar(events_df, x='brand_name', y='consumed', text_auto=True, labels={'consumed':'Total ML Consumed', 'brand_name': 'Brand'})
-        st.plotly_chart(fig_bar, use_container_width=True)
+        loc_ml = loc_stock['total_ml_available'].sum()
+        loc_bottles = loc_stock['open_bottles'].sum() + loc_stock['closed_bottles'].sum()
+        loc_sealed = loc_stock['closed_bottles'].sum()
+        loc_open = loc_stock['open_bottles'].sum()
+        
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total ML", f"{loc_ml:,.2f}")
+        c2.metric("Total Bottles", f"{loc_bottles}")
+        c3.metric("Sealed Bottles", f"{loc_sealed}")
+        c4.metric("Open Bottles", f"{loc_open}")
+        
+        # C. Charts per Location
+        colA, colB = st.columns(2)
+        
+        with colA:
+            brand_stock = loc_stock.groupby('brand_name')['total_ml_available'].sum().reset_index()
+            fig_pie = px.pie(brand_stock, names='brand_name', values='total_ml_available', hole=0.3, title="Stock by Brand")
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+        with colB:
+            if not loc_events.empty:
+                brand_cons = loc_events.groupby('brand_name')['ml_consumed'].sum().reset_index()
+                fig_bar = px.bar(brand_cons, x='brand_name', y='ml_consumed', text_auto=True, title="Consumption by Brand")
+                st.plotly_chart(fig_bar, use_container_width=True)
+            else:
+                st.write("No consumption data yet for this location.")
+                
+        st.markdown("<br>", unsafe_allow_html=True)
 
 
 def add_stock():
     st.title("➕ Add Stock")
     
-    date_added = st.date_input("Date Added", datetime.today())
+    locations = get_active_locations()
+    
+    col_loc, col_date = st.columns(2)
+    with col_loc:
+        location = st.selectbox("Location *", locations)
+    with col_date:
+        date_added = st.date_input("Date Added", datetime.today())
     
     col1, col2 = st.columns(2)
     
@@ -357,22 +464,28 @@ def add_stock():
             query = '''
                 INSERT INTO STOCK_TABLE 
                 (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                 closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             '''
             success = run_query(query, (
                 date_added.strftime("%Y-%m-%d"), brand_name.strip(), actual_item.strip(), ml_per_bottle, 
                 bottle_count, open_bottles, closed_bottles, open_ml, total_ml_available, 
-                "", price, supplier.strip(), remarks.strip()
+                "", price, supplier.strip(), remarks.strip(), location
             ))
             if success:
-                st.success(f"Successfully added {bottle_count} bottles of {brand_name} ({actual_item}).")
+                st.success(f"Successfully added {bottle_count} bottles of {brand_name} ({actual_item}) to {location}.")
 
 def request_stock_addition():
     st.title("📝 Request Stock Addition")
     st.info("Submit a request for new stock. An Admin will review and approve it.")
     
-    date_added = st.date_input("Date", datetime.today())
+    locations = get_active_locations()
+    
+    col_loc, col_date = st.columns(2)
+    with col_loc:
+        location = st.selectbox("Location *", locations)
+    with col_date:
+        date_added = st.date_input("Date", datetime.today())
     
     col1, col2 = st.columns(2)
     
@@ -400,12 +513,12 @@ def request_stock_addition():
         else:
             query = '''
                 INSERT INTO PENDING_STOCK_TABLE 
-                (item, brand_name, bottle_count, ml_per_bottle, price, supplier, remarks, status, requested_by, date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (item, brand_name, bottle_count, ml_per_bottle, price, supplier, remarks, status, requested_by, date, location)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             '''
             success = run_query(query, (
                 actual_item.strip(), brand_name.strip(), bottle_count, ml_per_bottle, price, 
-                supplier.strip(), remarks.strip(), 'pending', 'Normal User', date_added.strftime("%Y-%m-%d")
+                supplier.strip(), remarks.strip(), 'pending', 'Normal User', date_added.strftime("%Y-%m-%d"), location
             ))
             if success:
                 st.success("✅ Request sent for admin approval!")
@@ -420,9 +533,10 @@ def approve_requests():
         return
         
     for index, row in pending_df.iterrows():
-        with st.expander(f"Request #{row['request_id']} | {row['bottle_count']}x {row['brand_name']} ({row['item']})", expanded=True):
+        with st.expander(f"Request #{row['request_id']} | {row['location']} | {row['bottle_count']}x {row['brand_name']} ({row['item']})", expanded=True):
             col1, col2 = st.columns(2)
             with col1:
+                st.write(f"**Location:** {row['location']}")
                 st.write(f"**Item:** {row['item']}")
                 st.write(f"**Brand:** {row['brand_name']}")
                 st.write(f"**Bottle Count:** {row['bottle_count']}")
@@ -436,7 +550,6 @@ def approve_requests():
             colA, colB = st.columns([1, 1])
             with colA:
                 if st.button("Approve", key=f"approve_{row['request_id']}", type="primary", use_container_width=True):
-                    # Apply stock logic
                     open_bottles = 0
                     closed_bottles = row['bottle_count']
                     open_ml = 0.0
@@ -448,13 +561,13 @@ def approve_requests():
                     stock_query = '''
                         INSERT INTO STOCK_TABLE 
                         (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     '''
                     success = run_query(stock_query, (
                         row['date'], row['brand_name'].strip(), row['item'].strip(), row['ml_per_bottle'], 
                         row['bottle_count'], open_bottles, closed_bottles, open_ml, total_ml_available, 
-                        "", row['price'], row['supplier'], row['remarks']
+                        "", row['price'], row['supplier'], row['remarks'], row['location']
                     ))
                     
                     if success:
@@ -472,18 +585,23 @@ def view_stock():
     st.title("📦 View Stock")
     
     df = fetch_data("SELECT * FROM STOCK_TABLE ORDER BY date_added DESC")
+    locations = ["All Locations"] + get_active_locations()
     
     if df.empty:
         st.info("No stock data found.")
         return
         
-    col1, col2 = st.columns(2)
-    with col1:
+    col_loc, col_brand, col_search = st.columns(3)
+    with col_loc:
+        filter_loc = st.selectbox("Filter by Location", locations)
+    with col_brand:
         brands = ["All"] + df['brand_name'].unique().tolist()
         filter_brand = st.selectbox("Filter by Brand", brands)
-    with col2:
+    with col_search:
         search = st.text_input("Search (Item, Supplier)")
         
+    if filter_loc != "All Locations":
+        df = df[df['location'] == filter_loc]
     if filter_brand != "All":
         df = df[df['brand_name'] == filter_brand]
     if search:
@@ -507,9 +625,11 @@ def upload_stock_excel():
                        file_name="stock_template.xlsx", 
                        mime="application/vnd.ms-excel")
                            
-    st.write("Upload an Excel file to bulk add stock. Required columns: `item`, `brand_name`, `ml_per_bottle`, `bottle_count`, `bill_no`, `date`, `price`, `supplier`, `remarks`")
+    st.write("Upload an Excel file to bulk add stock. Required columns: `item`, `brand_name`, `location`, `ml_per_bottle`, `bottle_count`, `bill_no`, `date`, `price`, `supplier`, `remarks`")
     
     uploaded_file = st.file_uploader("Choose a .xlsx file (Stock)", type=["xlsx"])
+    active_locations = get_active_locations()
+    default_loc = active_locations[0] if active_locations else "Unknown"
     
     if uploaded_file is not None:
         try:
@@ -526,6 +646,13 @@ def upload_stock_excel():
                         failed_count += 1
                         continue
                         
+                    # Handle location
+                    loc_val = str(row.get('location', '')).strip()
+                    if not loc_val or pd.isna(loc_val) or loc_val == 'nan' or loc_val not in active_locations:
+                        location = default_loc
+                    else:
+                        location = loc_val
+
                     item_name = str(row.get('item', ''))
                     ml_per_bottle = float(row.get('ml_per_bottle', 750.0)) if pd.notna(row.get('ml_per_bottle')) else 750.0
                     quantity_added = int(row.get('bottle_count', 1)) if pd.notna(row.get('bottle_count')) else 1
@@ -549,11 +676,11 @@ def upload_stock_excel():
                     query = '''
                         INSERT INTO STOCK_TABLE 
                         (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     '''
                     if run_query(query, (date_val, brand_name, item_name, ml_per_bottle, quantity_added, 
-                                         open_bottles, closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks)):
+                                         open_bottles, closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)):
                         success_count += 1
                     else:
                         failed_count += 1
@@ -572,9 +699,11 @@ def upload_event_excel():
                        file_name="event_template.xlsx", 
                        mime="application/vnd.ms-excel")
                            
-    st.write("Upload an Excel file to bulk add events. Required columns: `date`, `occasion`, `brand_name`, `bottles_consumed`, `extra_ml`, `permit_number`")
+    st.write("Upload an Excel file to bulk add events. Required columns: `date`, `occasion`, `brand_name`, `location`, `bottles_consumed`, `extra_ml`, `permit_number`")
     
     uploaded_file = st.file_uploader("Choose a .xlsx file (Events)", type=["xlsx"])
+    active_locations = get_active_locations()
+    default_loc = active_locations[0] if active_locations else "Unknown"
     
     if uploaded_file is not None:
         try:
@@ -588,6 +717,14 @@ def upload_event_excel():
                 
                 for index, row in df.iterrows():
                     brand_name = str(row.get('brand_name', '')).strip()
+                    
+                    # Handle location
+                    loc_val = str(row.get('location', '')).strip()
+                    if not loc_val or pd.isna(loc_val) or loc_val == 'nan' or loc_val not in active_locations:
+                        location = default_loc
+                    else:
+                        location = loc_val
+                        
                     bottles_consumed = int(row.get('bottles_consumed', 0)) if pd.notna(row.get('bottles_consumed')) else 0
                     extra_ml = float(row.get('extra_ml', 0.0)) if pd.notna(row.get('extra_ml')) else 0.0
                     date_val = row.get('date', datetime.today().strftime("%Y-%m-%d"))
@@ -607,10 +744,10 @@ def upload_event_excel():
                         st.warning(f"Row {index + 2}: Skipped due to zero consumption.")
                         continue
                         
-                    brand_data = fetch_data("SELECT MAX(ml_per_bottle) as max_ml FROM STOCK_TABLE WHERE brand_name = ?", (brand_name,))
+                    brand_data = fetch_data("SELECT MAX(ml_per_bottle) as max_ml FROM STOCK_TABLE WHERE brand_name = ? AND location = ?", (brand_name, location))
                     if brand_data.empty or pd.isna(brand_data.iloc[0]['max_ml']):
                         failed_count += 1
-                        st.error(f"Row {index + 2}: Brand '{brand_name}' not found in current stock database.")
+                        st.error(f"Row {index + 2}: Brand '{brand_name}' not found in current stock for '{location}'.")
                         continue
                         
                     ml_per_bottle = brand_data.iloc[0]['max_ml']
@@ -622,7 +759,7 @@ def upload_event_excel():
 
                     ml_consumed = (bottles_consumed * ml_per_bottle) + extra_ml
                         
-                    success, result = apply_consumption_logic(brand_name, ml_consumed)
+                    success, result = apply_consumption_logic(brand_name, location, ml_consumed)
                     
                     if success:
                         stats = result
@@ -630,13 +767,13 @@ def upload_event_excel():
                             INSERT INTO EVENT_TABLE 
                             (date, occasion, brand_name, total_bottles_before, total_ml_before, ml_consumed, 
                              closed_bottles_opened, open_ml_used, total_bottles_after, total_ml_after, 
-                             open_bottles_after, closed_bottles_after, permit_number)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             open_bottles_after, closed_bottles_after, permit_number, location)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         '''
                         run_query(insert_q, (
                             date_val, occasion, brand_name, stats['total_bottles_before'], stats['total_ml_before'], 
                             ml_consumed, stats['closed_bottles_opened'], stats['open_ml_used'], stats['total_bottles_after'], 
-                            stats['total_ml_after'], stats['open_bottles_after'], stats['closed_bottles_after'], permit_number
+                            stats['total_ml_after'], stats['open_bottles_after'], stats['closed_bottles_after'], permit_number, location
                         ))
                         success_count += 1
                     else:
@@ -652,14 +789,17 @@ def upload_event_excel():
 def create_event():
     st.title("🎉 Create Event (Consumption)")
     
-    brands_df = fetch_data("SELECT DISTINCT brand_name FROM STOCK_TABLE WHERE total_ml_available > 0")
+    locations = get_active_locations()
+    location = st.selectbox("Select Location *", locations)
+    
+    brands_df = fetch_data("SELECT DISTINCT brand_name FROM STOCK_TABLE WHERE total_ml_available > 0 AND location = ?", (location,))
     if brands_df.empty:
-        st.warning("No available stock to consume.")
+        st.warning(f"No available stock to consume at {location}.")
         return
         
     brand = st.selectbox("Select Brand to Consume", brands_df['brand_name'].tolist())
     
-    stock_rows = fetch_data("SELECT SUM(closed_bottles) as c, SUM(open_bottles) as o, SUM(total_ml_available) as t, MAX(ml_per_bottle) as m FROM STOCK_TABLE WHERE brand_name = ? AND total_ml_available > 0", (brand,))
+    stock_rows = fetch_data("SELECT SUM(closed_bottles) as c, SUM(open_bottles) as o, SUM(total_ml_available) as t, MAX(ml_per_bottle) as m FROM STOCK_TABLE WHERE brand_name = ? AND location = ? AND total_ml_available > 0", (brand, location))
     
     if not stock_rows.empty and stock_rows.iloc[0]['t'] is not None:
         total_ml_before = stock_rows.iloc[0]['t']
@@ -668,7 +808,7 @@ def create_event():
         ml_per_bottle = stock_rows.iloc[0]['m']
         total_bottles_before = total_closed_before + total_open_before
         
-        st.info(f"📦 **Current Stock available:** {total_bottles_before} Bottles ({total_closed_before} Sealed, {total_open_before} Open) | {total_ml_before:,.2f} Total ML")
+        st.info(f"📦 **Current Stock available at {location}:** {total_bottles_before} Bottles ({total_closed_before} Sealed, {total_open_before} Open) | {total_ml_before:,.2f} Total ML")
         
         date = st.date_input("Event Date", datetime.today())
         occasion = st.text_input("Occasion / Event Name")
@@ -710,7 +850,7 @@ def create_event():
             st.success(f"📊 **Remaining AFTER Event (Preview):** ~{est_total} Bottles left | {preview_ml:,.2f} ML left")
             
             if st.button("Record Consumption", type="primary"):
-                success, result = apply_consumption_logic(brand, total_ml_consumed)
+                success, result = apply_consumption_logic(brand, location, total_ml_consumed)
                 
                 if success:
                     stats = result
@@ -718,13 +858,13 @@ def create_event():
                         INSERT INTO EVENT_TABLE 
                         (date, occasion, brand_name, total_bottles_before, total_ml_before, ml_consumed, 
                          closed_bottles_opened, open_ml_used, total_bottles_after, total_ml_after, 
-                         open_bottles_after, closed_bottles_after, permit_number)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         open_bottles_after, closed_bottles_after, permit_number, location)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     '''
                     run_query(insert_q, (
                         date.strftime("%Y-%m-%d"), occasion, brand, stats['total_bottles_before'], stats['total_ml_before'], 
                         total_ml_consumed, stats['closed_bottles_opened'], stats['open_ml_used'], stats['total_bottles_after'], 
-                        stats['total_ml_after'], stats['open_bottles_after'], stats['closed_bottles_after'], permit_number
+                        stats['total_ml_after'], stats['open_bottles_after'], stats['closed_bottles_after'], permit_number, location
                     ))
                     st.success("✅ Consumption recorded successfully!")
                 else:
@@ -734,19 +874,24 @@ def event_history():
     st.title("📜 Event History")
     
     df = fetch_data("SELECT * FROM EVENT_TABLE ORDER BY event_id DESC")
+    locations = ["All Locations"] + get_active_locations()
     
     if df.empty:
         st.info("No events recorded yet.")
         return
         
-    col1, col2 = st.columns(2)
-    with col1:
+    col_loc, col_brand, col_occ = st.columns(3)
+    with col_loc:
+        filter_loc = st.selectbox("Filter by Location", locations)
+    with col_brand:
         brands = ["All"] + df['brand_name'].unique().tolist()
         filter_brand = st.selectbox("Filter by Brand", brands, key="ev_brand")
-    with col2:
+    with col_occ:
         occasions = ["All"] + df['occasion'].unique().tolist()
         filter_occ = st.selectbox("Filter by Occasion", occasions)
         
+    if filter_loc != "All Locations":
+        df = df[df['location'] == filter_loc]
     if filter_brand != "All":
         df = df[df['brand_name'] == filter_brand]
     if filter_occ != "All":
@@ -763,9 +908,19 @@ def event_history():
 def brand_summary():
     st.title("📋 Brand Summary")
     
-    query = '''
+    locations = ["All Locations"] + get_active_locations()
+    filter_loc = st.selectbox("Filter by Location", locations)
+    
+    where_clause = ""
+    params = ()
+    if filter_loc != "All Locations":
+        where_clause = "WHERE location = ?"
+        params = (filter_loc,)
+        
+    query = f'''
         SELECT 
             brand_name, 
+            location,
             MAX(ml_per_bottle) as ml_per_bottle,
             SUM(quantity_added) as total_bottles_added,
             SUM(closed_bottles) as current_closed_bottles,
@@ -773,9 +928,10 @@ def brand_summary():
             SUM(open_ml) as current_open_ml,
             SUM(total_ml_available) as current_total_ml
         FROM STOCK_TABLE
-        GROUP BY brand_name
+        {where_clause}
+        GROUP BY brand_name, location
     '''
-    df = fetch_data(query)
+    df = fetch_data(query, params)
     
     if df.empty:
         st.info("No data available.")
@@ -785,6 +941,7 @@ def brand_summary():
     
     summary_mapping = {
         'brand_name': 'Brand Name',
+        'location': 'Location',
         'ml_per_bottle': 'ML per Bottle',
         'total_bottles_added': 'Total Bottles Added',
         'current_closed_bottles': 'Sealed Bottles',
@@ -798,7 +955,7 @@ def brand_summary():
 
 def edit_delete_data():
     st.title("⚙️ Edit / Delete Data")
-    st.warning("⚠️ Edits here modify the raw database tables. Be careful.")
+    st.warning("⚠️ Edits here modify the raw database tables. Be careful. Ensure location fields perfectly match active locations.")
     
     tab1, tab2 = st.tabs(["Stock Data", "Event Data"])
     
@@ -871,7 +1028,7 @@ def main():
                 
         with col2:
             st.subheader("🛡️ Admin Login")
-            st.write("Full access to manage inventory, events, and approve requests.")
+            st.write("Full access to manage inventory, events, locations, and approve requests.")
             admin_user = st.text_input("Username")
             admin_pass = st.text_input("Password", type="password")
             if st.button("Login as Admin", type="primary"):
@@ -880,7 +1037,7 @@ def main():
                     st.rerun()
                 else:
                     st.error("Invalid Admin Credentials")
-        return # Stop execution until a role is selected
+        return
 
     # SIDEBAR NAVIGATION
     st.sidebar.title("🍷 Liquor Tracker")
@@ -893,7 +1050,6 @@ def main():
     st.sidebar.markdown("---")
     
     if st.session_state['user_role'] == 'admin':
-        # Admin Notification for pending requests
         pending_count_df = fetch_data("SELECT COUNT(*) as count FROM PENDING_STOCK_TABLE WHERE status='pending'")
         if not pending_count_df.empty and pending_count_df.iloc[0]['count'] > 0:
             count = pending_count_df.iloc[0]['count']
@@ -901,6 +1057,7 @@ def main():
             
         menu = [
             "Dashboard", 
+            "Manage Locations",
             "Add Stock", 
             "View Stock", 
             "Upload Stock Excel", 
@@ -924,6 +1081,8 @@ def main():
     # ROUTING
     if choice == "Dashboard":
         dashboard()
+    elif choice == "Manage Locations":
+        manage_locations()
     elif choice == "Add Stock":
         add_stock()
     elif choice == "View Stock":
