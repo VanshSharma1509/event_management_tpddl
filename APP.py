@@ -3,7 +3,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.express as px
 import io
 
@@ -54,7 +54,9 @@ def init_db():
             price REAL,
             supplier TEXT,
             remarks TEXT,
-            location TEXT
+            location TEXT,
+            mfg_date TEXT,
+            expiry_date TEXT
         )
     ''')
     
@@ -116,6 +118,12 @@ def init_db():
     try: c.execute("ALTER TABLE PENDING_STOCK_TABLE ADD COLUMN location TEXT")
     except sqlite3.OperationalError: pass
 
+    try: c.execute("ALTER TABLE STOCK_TABLE ADD COLUMN mfg_date TEXT")
+    except sqlite3.OperationalError: pass
+
+    try: c.execute("ALTER TABLE STOCK_TABLE ADD COLUMN expiry_date TEXT")
+    except sqlite3.OperationalError: pass
+
     # Cleanup legacy null locations
     c.execute("UPDATE STOCK_TABLE SET location = 'Cenpeid Guest House' WHERE location IS NULL OR location = ''")
     c.execute("UPDATE EVENT_TABLE SET location = 'Cenpeid Guest House' WHERE location IS NULL OR location = ''")
@@ -152,7 +160,7 @@ def get_active_locations():
 def get_template_excel(template_type):
     buffer = io.BytesIO()
     if template_type == 'stock':
-        df = pd.DataFrame(columns=['item', 'brand_name', 'location', 'ml_per_bottle', 'bottle_count', 'bill_no', 'date', 'price', 'supplier', 'remarks'])
+        df = pd.DataFrame(columns=['item', 'brand_name', 'location', 'ml_per_bottle', 'bottle_count', 'bill_no', 'date', 'price', 'supplier', 'remarks', 'mfg_date', 'expiry_date'])
     elif template_type == 'event':
         df = pd.DataFrame(columns=['date', 'occasion', 'brand_name', 'location', 'bottles_consumed', 'extra_ml', 'permit_number'])
     
@@ -191,7 +199,9 @@ def rename_for_display(df):
         'bottle_count': 'Bottle Count',
         'status': 'Status',
         'requested_by': 'Requested By',
-        'location': 'Location'
+        'location': 'Location',
+        'mfg_date': 'MFG Date',
+        'expiry_date': 'Expiry Date'
     }
     return df.rename(columns=mapping)
 
@@ -448,15 +458,25 @@ def add_stock():
         ml_per_bottle = st.number_input("ML per Bottle *", min_value=1.0, value=750.0, step=50.0)
         supplier = st.text_input("Supplier")
         remarks = st.text_area("Remarks")
+
+    col_mfg, col_exp = st.columns(2)
+    with col_mfg:
+        mfg_date_val = st.date_input("MFG Date (optional)", value=None)
+    with col_exp:
+        expiry_date_val = st.date_input("Expiry Date (optional)", value=None)
         
     if st.button("Save Stock", type="primary"):
         if not brand_name or not actual_item:
             st.error("Item and Brand Name are required.")
+        elif mfg_date_val and expiry_date_val and expiry_date_val <= mfg_date_val:
+            st.error("Expiry Date must be after MFG Date.")
         else:
             open_bottles = 0
             closed_bottles = bottle_count
             open_ml = 0.0
             total_ml_available = bottle_count * ml_per_bottle
+            mfg_str = mfg_date_val.strftime("%Y-%m-%d") if mfg_date_val else None
+            expiry_str = expiry_date_val.strftime("%Y-%m-%d") if expiry_date_val else None
             
             run_query("INSERT OR IGNORE INTO BRAND_MASTER (brand_name, standard_ml, category) VALUES (?, ?, ?)", 
                       (brand_name.strip(), ml_per_bottle, actual_item.strip()))
@@ -464,13 +484,14 @@ def add_stock():
             query = '''
                 INSERT INTO STOCK_TABLE 
                 (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                 closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location,
+                 mfg_date, expiry_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             '''
             success = run_query(query, (
                 date_added.strftime("%Y-%m-%d"), brand_name.strip(), actual_item.strip(), ml_per_bottle, 
                 bottle_count, open_bottles, closed_bottles, open_ml, total_ml_available, 
-                "", price, supplier.strip(), remarks.strip(), location
+                "", price, supplier.strip(), remarks.strip(), location, mfg_str, expiry_str
             ))
             if success:
                 st.success(f"Successfully added {bottle_count} bottles of {brand_name} ({actual_item}) to {location}.")
@@ -610,6 +631,32 @@ def view_stock():
         df = df[mask]
         
     df_display = rename_for_display(df)
+
+    # Add expiry status indicator column
+    if 'expiry_date' in df.columns:
+        def expiry_status(exp):
+            if not exp or pd.isna(exp) or str(exp).strip() == '':
+                return ''
+            try:
+                exp_date = datetime.strptime(str(exp)[:10], "%Y-%m-%d").date()
+                today = datetime.today().date()
+                if exp_date < today:
+                    return '🔴 Expired'
+                elif exp_date <= today + timedelta(days=30):
+                    return '🟡 Expiring Soon'
+                else:
+                    return '🟢 Valid'
+            except ValueError:
+                return ''
+        df_display['Expiry Status'] = df['expiry_date'].apply(expiry_status)
+
+        expired_count = (df_display['Expiry Status'] == '🔴 Expired').sum()
+        soon_count = (df_display['Expiry Status'] == '🟡 Expiring Soon').sum()
+        if expired_count > 0:
+            st.error(f"🔴 {expired_count} stock entry(ies) are **EXPIRED**.")
+        if soon_count > 0:
+            st.warning(f"🟡 {soon_count} stock entry(ies) are expiring within 30 days.")
+
     st.dataframe(df_display, use_container_width=True)
     
     buffer = io.BytesIO()
@@ -625,7 +672,7 @@ def upload_stock_excel():
                        file_name="stock_template.xlsx", 
                        mime="application/vnd.ms-excel")
                            
-    st.write("Upload an Excel file to bulk add stock. Required columns: `item`, `brand_name`, `location`, `ml_per_bottle`, `bottle_count`, `bill_no`, `date`, `price`, `supplier`, `remarks`")
+    st.write("Upload an Excel file to bulk add stock. Required columns: `item`, `brand_name`, `location`, `ml_per_bottle`, `bottle_count`, `bill_no`, `date`, `price`, `supplier`, `remarks`. Optional: `mfg_date`, `expiry_date`")
     
     uploaded_file = st.file_uploader("Choose a .xlsx file (Stock)", type=["xlsx"])
     active_locations = get_active_locations()
@@ -665,6 +712,11 @@ def upload_stock_excel():
                     if pd.isna(date_val): date_val = datetime.today().strftime("%Y-%m-%d")
                     else: date_val = str(date_val)[:10]
 
+                    mfg_val = row.get('mfg_date', None)
+                    expiry_val = row.get('expiry_date', None)
+                    mfg_str = str(mfg_val)[:10] if pd.notna(mfg_val) and mfg_val else None
+                    expiry_str = str(expiry_val)[:10] if pd.notna(expiry_val) and expiry_val else None
+
                     open_bottles = 0
                     closed_bottles = quantity_added
                     open_ml = 0.0
@@ -676,11 +728,12 @@ def upload_stock_excel():
                     query = '''
                         INSERT INTO STOCK_TABLE 
                         (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location,
+                         mfg_date, expiry_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     '''
                     if run_query(query, (date_val, brand_name, item_name, ml_per_bottle, quantity_added, 
-                                         open_bottles, closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)):
+                                         open_bottles, closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location, mfg_str, expiry_str)):
                         success_count += 1
                     else:
                         failed_count += 1
@@ -749,6 +802,17 @@ def upload_event_excel():
                         failed_count += 1
                         st.error(f"Row {index + 2}: Brand '{brand_name}' not found in current stock for '{location}'.")
                         continue
+
+                    # Check if all available stock of this brand is expired
+                    today_str = datetime.today().strftime("%Y-%m-%d")
+                    non_expired = fetch_data(
+                        "SELECT COUNT(*) as cnt FROM STOCK_TABLE WHERE brand_name = ? AND location = ? AND total_ml_available > 0 AND (expiry_date IS NULL OR expiry_date = '' OR expiry_date >= ?)",
+                        (brand_name, location, today_str)
+                    )
+                    if non_expired.iloc[0]['cnt'] == 0:
+                        failed_count += 1
+                        st.error(f"Row {index + 2}: All stock of '{brand_name}' at '{location}' is expired. Cannot use for event.")
+                        continue
                         
                     ml_per_bottle = brand_data.iloc[0]['max_ml']
                     
@@ -798,6 +862,22 @@ def create_event():
         return
         
     brand = st.selectbox("Select Brand to Consume", brands_df['brand_name'].tolist())
+
+    # Warn if all available stock of the brand is expired
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    non_expired_stock = fetch_data(
+        "SELECT COUNT(*) as cnt FROM STOCK_TABLE WHERE brand_name = ? AND location = ? AND total_ml_available > 0 AND (expiry_date IS NULL OR expiry_date = '' OR expiry_date >= ?)",
+        (brand, location, today_str)
+    )
+    if non_expired_stock.iloc[0]['cnt'] == 0:
+        st.error(f"⚠️ All available stock of **{brand}** at **{location}** is expired. Please remove or replace expired stock before recording consumption.")
+        return
+    expired_entries = fetch_data(
+        "SELECT COUNT(*) as cnt FROM STOCK_TABLE WHERE brand_name = ? AND location = ? AND total_ml_available > 0 AND expiry_date IS NOT NULL AND expiry_date != '' AND expiry_date < ?",
+        (brand, location, today_str)
+    )
+    if expired_entries.iloc[0]['cnt'] > 0:
+        st.warning(f"🟡 Note: {expired_entries.iloc[0]['cnt']} stock entry(ies) of **{brand}** at **{location}** are expired.")
     
     stock_rows = fetch_data("SELECT SUM(closed_bottles) as c, SUM(open_bottles) as o, SUM(total_ml_available) as t, MAX(ml_per_bottle) as m FROM STOCK_TABLE WHERE brand_name = ? AND location = ? AND total_ml_available > 0", (brand, location))
     
@@ -926,7 +1006,8 @@ def brand_summary():
             SUM(closed_bottles) as current_closed_bottles,
             SUM(open_bottles) as current_open_bottles,
             SUM(open_ml) as current_open_ml,
-            SUM(total_ml_available) as current_total_ml
+            SUM(total_ml_available) as current_total_ml,
+            MIN(CASE WHEN expiry_date IS NOT NULL AND expiry_date != '' THEN expiry_date END) as earliest_expiry
         FROM STOCK_TABLE
         {where_clause}
         GROUP BY brand_name, location
@@ -939,6 +1020,23 @@ def brand_summary():
         
     df['total_current_bottles'] = df['current_closed_bottles'] + df['current_open_bottles']
     
+    # Add expiry status for the earliest expiry date per brand-location
+    def brand_expiry_status(exp):
+        if not exp or pd.isna(exp) or str(exp).strip() == '':
+            return 'N/A'
+        try:
+            exp_date = datetime.strptime(str(exp)[:10], "%Y-%m-%d").date()
+            today = datetime.today().date()
+            if exp_date < today:
+                return '🔴 Expired'
+            elif exp_date <= today + timedelta(days=30):
+                return '🟡 Expiring Soon'
+            else:
+                return '🟢 Valid'
+        except ValueError:
+            return 'N/A'
+    df['expiry_status'] = df['earliest_expiry'].apply(brand_expiry_status)
+
     summary_mapping = {
         'brand_name': 'Brand Name',
         'location': 'Location',
@@ -948,7 +1046,9 @@ def brand_summary():
         'current_open_bottles': 'Open Bottles',
         'total_current_bottles': 'Total Bottles Left',
         'current_open_ml': 'Open ML Left',
-        'current_total_ml': 'Total ML Left'
+        'current_total_ml': 'Total ML Left',
+        'earliest_expiry': 'Earliest Expiry',
+        'expiry_status': 'Expiry Status'
     }
     df_display = df.rename(columns=summary_mapping)
     st.dataframe(df_display, use_container_width=True)
