@@ -1,10 +1,10 @@
-# app.py
 import streamlit as st
 import sqlite3
 import pandas as pd
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.express as px
+import plotly.graph_objects as go
 import io
 
 # ==========================================
@@ -12,6 +12,11 @@ import io
 # ==========================================
 ADMIN_USER = "barstock_tatapower"
 ADMIN_PASS = "amittpddl"
+
+# Expiry alert thresholds (in days)
+CRITICAL_EXPIRY_DAYS = 7      # Red alert
+WARNING_EXPIRY_DAYS = 30      # Yellow alert
+SAFE_EXPIRY_DAYS = 90         # Green status
 
 # ==========================================
 # DATABASE SETUP & HELPERS
@@ -54,7 +59,9 @@ def init_db():
             price REAL,
             supplier TEXT,
             remarks TEXT,
-            location TEXT
+            location TEXT,
+            mfg_date TEXT,
+            expiry_date TEXT
         )
     ''')
     
@@ -74,7 +81,8 @@ def init_db():
             open_bottles_after INTEGER,
             closed_bottles_after INTEGER,
             permit_number TEXT,
-            location TEXT
+            location TEXT,
+            fifo_note TEXT
         )
     ''')
     
@@ -82,7 +90,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS BRAND_MASTER (
             brand_name TEXT PRIMARY KEY,
             standard_ml REAL,
-            category TEXT
+            category TEXT,
+            typical_shelf_life_days INTEGER
         )
     ''')
 
@@ -99,11 +108,31 @@ def init_db():
             status TEXT,
             requested_by TEXT,
             date TEXT,
-            location TEXT
+            location TEXT,
+            mfg_date TEXT,
+            expiry_date TEXT
         )
     ''')
     
-    # Safe migrations for existing databases to add columns if they don't exist
+    # Safe migrations for existing databases
+    try: c.execute("ALTER TABLE STOCK_TABLE ADD COLUMN mfg_date TEXT")
+    except sqlite3.OperationalError: pass
+    
+    try: c.execute("ALTER TABLE STOCK_TABLE ADD COLUMN expiry_date TEXT")
+    except sqlite3.OperationalError: pass
+    
+    try: c.execute("ALTER TABLE EVENT_TABLE ADD COLUMN fifo_note TEXT")
+    except sqlite3.OperationalError: pass
+    
+    try: c.execute("ALTER TABLE PENDING_STOCK_TABLE ADD COLUMN mfg_date TEXT")
+    except sqlite3.OperationalError: pass
+    
+    try: c.execute("ALTER TABLE PENDING_STOCK_TABLE ADD COLUMN expiry_date TEXT")
+    except sqlite3.OperationalError: pass
+    
+    try: c.execute("ALTER TABLE BRAND_MASTER ADD COLUMN typical_shelf_life_days INTEGER")
+    except sqlite3.OperationalError: pass
+    
     try: c.execute("ALTER TABLE EVENT_TABLE ADD COLUMN permit_number TEXT")
     except sqlite3.OperationalError: pass
     
@@ -152,13 +181,83 @@ def get_active_locations():
 def get_template_excel(template_type):
     buffer = io.BytesIO()
     if template_type == 'stock':
-        df = pd.DataFrame(columns=['item', 'brand_name', 'location', 'ml_per_bottle', 'bottle_count', 'bill_no', 'date', 'price', 'supplier', 'remarks'])
+        df = pd.DataFrame(columns=['item', 'brand_name', 'location', 'ml_per_bottle', 'bottle_count', 
+                                   'mfg_date', 'expiry_date', 'bill_no', 'date', 'price', 'supplier', 'remarks'])
     elif template_type == 'event':
         df = pd.DataFrame(columns=['date', 'occasion', 'brand_name', 'location', 'bottles_consumed', 'extra_ml', 'permit_number'])
     
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Template')
     return buffer.getvalue()
+
+# ==========================================
+# EXPIRY & FIFO UTILITIES
+# ==========================================
+
+def calculate_days_to_expiry(expiry_date_str):
+    """Calculate days remaining until expiry. Returns negative if expired."""
+    if not expiry_date_str:
+        return None
+    try:
+        expiry = datetime.strptime(expiry_date_str, "%Y-%m-%d")
+        today = datetime.today()
+        days = (expiry - today).days
+        return days
+    except:
+        return None
+
+def get_expiry_status(days_to_expiry):
+    """Return status badge and color for expiry status."""
+    if days_to_expiry is None:
+        return "❓ Unknown", "gray"
+    elif days_to_expiry < 0:
+        return "⚫ EXPIRED", "red"
+    elif days_to_expiry < CRITICAL_EXPIRY_DAYS:
+        return "🔴 CRITICAL", "red"
+    elif days_to_expiry < WARNING_EXPIRY_DAYS:
+        return "🟡 EXPIRING SOON", "orange"
+    elif days_to_expiry >= SAFE_EXPIRY_DAYS:
+        return "🟢 GOOD", "green"
+    else:
+        return "🟡 EXPIRING SOON", "orange"
+
+def get_fifo_order(brand, location):
+    """Get stock ordered by FIFO principle (oldest/closest to expiry first)."""
+    query = '''
+        SELECT * FROM STOCK_TABLE 
+        WHERE brand_name = ? AND location = ? AND total_ml_available > 0
+        ORDER BY 
+            CASE 
+                WHEN expiry_date IS NULL THEN 1
+                ELSE 0
+            END,
+            expiry_date ASC,
+            date_added ASC
+    '''
+    return fetch_data(query, (brand, location))
+
+def validate_dates(mfg_date, expiry_date):
+    """Validate manufacturing and expiry dates."""
+    errors = []
+    
+    try:
+        mfg = datetime.strptime(mfg_date, "%Y-%m-%d") if mfg_date else None
+        exp = datetime.strptime(expiry_date, "%Y-%m-%d") if expiry_date else None
+        today = datetime.today()
+        
+        if mfg and mfg > today:
+            errors.append("Manufacturing date cannot be in the future.")
+        
+        if mfg and exp and exp <= mfg:
+            errors.append("Expiry date must be after manufacturing date.")
+        
+        if exp and exp < today:
+            errors.append("⚠️ WARNING: Expiry date is already passed (Expired).")
+            
+    except ValueError:
+        errors.append("Invalid date format. Use YYYY-MM-DD.")
+    
+    return errors
 
 def rename_for_display(df):
     mapping = {
@@ -174,6 +273,8 @@ def rename_for_display(df):
         'price': 'Price',
         'supplier': 'Supplier',
         'remarks': 'Remarks',
+        'mfg_date': 'MFG Date',
+        'expiry_date': 'Expiry Date',
         'event_id': 'Event ID',
         'date': 'Date',
         'occasion': 'Occasion',
@@ -191,7 +292,8 @@ def rename_for_display(df):
         'bottle_count': 'Bottle Count',
         'status': 'Status',
         'requested_by': 'Requested By',
-        'location': 'Location'
+        'location': 'Location',
+        'fifo_note': 'FIFO Note'
     }
     return df.rename(columns=mapping)
 
@@ -200,6 +302,7 @@ def rename_for_display(df):
 # ==========================================
 
 def apply_consumption_logic(brand, location, ml_consumed):
+    """Apply FIFO consumption logic - uses expiry-closest stock first."""
     if ml_consumed <= 0:
         return False, "Consumption amount must be greater than zero."
 
@@ -207,13 +310,18 @@ def apply_consumption_logic(brand, location, ml_consumed):
     c = conn.cursor()
     
     try:
-        stock_rows = pd.read_sql_query(
-            "SELECT * FROM STOCK_TABLE WHERE brand_name = ? AND location = ? AND total_ml_available > 0 ORDER BY date_added ASC", 
-            conn, params=(brand, location)
-        )
+        # Get stock ordered by FIFO (expiry date first)
+        stock_rows = get_fifo_order(brand, location)
         
         if stock_rows.empty:
             raise ValueError(f"No stock available for {brand} at {location}.")
+        
+        # Check for expired stock and warn
+        expired_rows = stock_rows[
+            stock_rows['expiry_date'].apply(lambda x: calculate_days_to_expiry(x) is not None and calculate_days_to_expiry(x) < 0)
+        ]
+        if not expired_rows.empty:
+            st.warning(f"⚠️ WARNING: {len(expired_rows)} batch(es) of {brand} have EXPIRED at {location}. These should be removed.")
             
         total_ml_before = float(stock_rows['total_ml_available'].sum())
         total_closed_before = int(stock_rows['closed_bottles'].sum())
@@ -226,6 +334,7 @@ def apply_consumption_logic(brand, location, ml_consumed):
         remaining_to_consume = float(ml_consumed)
         total_open_ml_used = 0.0
         total_closed_opened = 0
+        fifo_details = []
         
         for index, row in stock_rows.iterrows():
             if remaining_to_consume <= 0:
@@ -237,8 +346,10 @@ def apply_consumption_logic(brand, location, ml_consumed):
             r_open = int(row['open_bottles'])
             r_ml_per_bottle = float(row['ml_per_bottle'])
             r_total_ml = float(row['total_ml_available'])
+            expiry_str = row['expiry_date']
             
             consumed_from_row = min(remaining_to_consume, r_total_ml)
+            fifo_details.append(f"Batch ({expiry_str}): -{consumed_from_row:.0f}ML")
             
             if r_open_ml >= consumed_from_row:
                 r_open_ml -= consumed_from_row
@@ -289,7 +400,8 @@ def apply_consumption_logic(brand, location, ml_consumed):
             'open_bottles_after': total_open_after,
             'closed_bottles_after': total_closed_after,
             'open_ml_used': total_open_ml_used,
-            'closed_bottles_opened': total_closed_opened
+            'closed_bottles_opened': total_closed_opened,
+            'fifo_note': " | ".join(fifo_details)
         }
         
         return True, stats
@@ -338,7 +450,6 @@ def manage_locations():
         col1.write(f"🏢 **{loc}**")
         
         if col2.button("Delete", key=f"del_{loc}", use_container_width=True):
-            # Check if stock exists
             stock_check = fetch_data("SELECT COUNT(*) as count FROM STOCK_TABLE WHERE location = ?", (loc,))
             if stock_check.iloc[0]['count'] > 0:
                 st.error(f"Cannot delete '{loc}' because it has active stock entries. Please clear stock first.")
@@ -348,7 +459,7 @@ def manage_locations():
                 st.rerun()
 
 def dashboard():
-    st.title("📊 Dashboard Metrics")
+    st.title("📊 Dashboard & Expiry Alerts")
     
     locations = get_active_locations()
     stock_df = fetch_data("SELECT * FROM STOCK_TABLE")
@@ -357,41 +468,78 @@ def dashboard():
     if stock_df.empty:
         st.info("No stock data available yet.")
         return
-        
-    # A. Overall Metrics
-    st.markdown("### 🌍 Overall Inventory Summary")
-    total_ml = stock_df['total_ml_available'].sum()
-    total_bottles = stock_df['open_bottles'].sum() + stock_df['closed_bottles'].sum()
     
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Overall Total Inventory (ML)", f"{total_ml:,.2f}")
-    col2.metric("Overall Total Bottles", f"{total_bottles}")
+    # Calculate expiry metrics
+    stock_df['days_to_expiry'] = stock_df['expiry_date'].apply(calculate_days_to_expiry)
+    expired = stock_df[stock_df['days_to_expiry'] < 0]
+    expiring_critical = stock_df[(stock_df['days_to_expiry'] >= 0) & (stock_df['days_to_expiry'] < CRITICAL_EXPIRY_DAYS)]
+    expiring_warning = stock_df[(stock_df['days_to_expiry'] >= CRITICAL_EXPIRY_DAYS) & (stock_df['days_to_expiry'] < WARNING_EXPIRY_DAYS)]
+    
+    # A. Expiry Alert Section
+    st.markdown("### 🚨 EXPIRY ALERTS")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    exp_bottles = len(expired)
+    exp_ml = expired['total_ml_available'].sum() if not expired.empty else 0
+    col1.metric("⚫ EXPIRED Bottles", f"{exp_bottles}", f"{exp_ml:,.0f} ML", delta_color="inverse")
+    
+    crit_bottles = len(expiring_critical)
+    crit_ml = expiring_critical['total_ml_available'].sum() if not expiring_critical.empty else 0
+    col2.metric("🔴 CRITICAL (< 7 days)", f"{crit_bottles}", f"{crit_ml:,.0f} ML", delta_color="inverse")
+    
+    warn_bottles = len(expiring_warning)
+    warn_ml = expiring_warning['total_ml_available'].sum() if not expiring_warning.empty else 0
+    col3.metric("🟡 WARNING (7-30 days)", f"{warn_bottles}", f"{warn_ml:,.0f} ML")
+    
+    safe_df = stock_df[stock_df['days_to_expiry'] >= WARNING_EXPIRY_DAYS]
+    safe_bottles = len(safe_df)
+    safe_ml = safe_df['total_ml_available'].sum() if not safe_df.empty else 0
+    col4.metric("🟢 GOOD (> 30 days)", f"{safe_bottles}", f"{safe_ml:,.0f} ML")
+    
+    if not expired.empty:
+        st.error("⚠️ **CRITICAL**: Following stock has EXPIRED and must be removed:")
+        exp_display = rename_for_display(expired[['brand_name', 'location', 'expiry_date', 'total_ml_available']])
+        st.dataframe(exp_display, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # B. Overall Metrics
+    st.markdown("### 🌍 Overall Inventory Summary")
+    total_ml = stock_df[stock_df['days_to_expiry'] >= 0]['total_ml_available'].sum()  # Exclude expired
+    total_bottles = (stock_df[stock_df['days_to_expiry'] >= 0]['open_bottles'].sum() + 
+                     stock_df[stock_df['days_to_expiry'] >= 0]['closed_bottles'].sum())
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Valid Inventory (ML)", f"{total_ml:,.2f}")
+    c2.metric("Valid Bottles", f"{total_bottles}")
     
     if not events_df.empty:
         top_brand_df = events_df.groupby('brand_name')['ml_consumed'].sum().reset_index()
         top_brand = top_brand_df.loc[top_brand_df['ml_consumed'].idxmax()]['brand_name']
-        col3.metric("Most Consumed Brand (Overall)", top_brand)
+        c3.metric("Most Consumed Brand", top_brand)
     else:
-        col3.metric("Most Consumed Brand", "N/A")
+        c3.metric("Most Consumed Brand", "N/A")
 
     st.markdown("---")
     
-    # B. Location-wise Split
+    # C. Location-wise Split
     st.markdown("### 🏢 Location-wise Split")
     
     for loc in locations:
         st.markdown(f"#### 📌 {loc}")
         loc_stock = stock_df[stock_df['location'] == loc]
-        loc_events = events_df[events_df['location'] == loc] if not events_df.empty else pd.DataFrame()
+        loc_stock['days_to_expiry'] = loc_stock['expiry_date'].apply(calculate_days_to_expiry)
         
         if loc_stock.empty:
             st.info(f"No stock data for {loc}.")
             continue
             
-        loc_ml = loc_stock['total_ml_available'].sum()
-        loc_bottles = loc_stock['open_bottles'].sum() + loc_stock['closed_bottles'].sum()
-        loc_sealed = loc_stock['closed_bottles'].sum()
-        loc_open = loc_stock['open_bottles'].sum()
+        loc_ml = loc_stock[loc_stock['days_to_expiry'] >= 0]['total_ml_available'].sum()
+        loc_bottles = (loc_stock[loc_stock['days_to_expiry'] >= 0]['open_bottles'].sum() + 
+                       loc_stock[loc_stock['days_to_expiry'] >= 0]['closed_bottles'].sum())
+        loc_sealed = loc_stock[loc_stock['days_to_expiry'] >= 0]['closed_bottles'].sum()
+        loc_open = loc_stock[loc_stock['days_to_expiry'] >= 0]['open_bottles'].sum()
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total ML", f"{loc_ml:,.2f}")
@@ -399,15 +547,16 @@ def dashboard():
         c3.metric("Sealed Bottles", f"{loc_sealed}")
         c4.metric("Open Bottles", f"{loc_open}")
         
-        # C. Charts per Location
+        # Charts per Location
         colA, colB = st.columns(2)
         
         with colA:
-            brand_stock = loc_stock.groupby('brand_name')['total_ml_available'].sum().reset_index()
+            brand_stock = loc_stock[loc_stock['days_to_expiry'] >= 0].groupby('brand_name')['total_ml_available'].sum().reset_index()
             fig_pie = px.pie(brand_stock, names='brand_name', values='total_ml_available', hole=0.3, title="Stock by Brand")
             st.plotly_chart(fig_pie, use_container_width=True)
             
         with colB:
+            loc_events = events_df[events_df['location'] == loc] if not events_df.empty else pd.DataFrame()
             if not loc_events.empty:
                 brand_cons = loc_events.groupby('brand_name')['ml_consumed'].sum().reset_index()
                 fig_bar = px.bar(brand_cons, x='brand_name', y='ml_consumed', text_auto=True, title="Consumption by Brand")
@@ -420,6 +569,7 @@ def dashboard():
 
 def add_stock():
     st.title("➕ Add Stock")
+    st.info("✅ **TIP**: Always enter MFG and Expiry dates for compliance and inventory rotation.")
     
     locations = get_active_locations()
     
@@ -449,168 +599,92 @@ def add_stock():
         supplier = st.text_input("Supplier")
         remarks = st.text_area("Remarks")
         
+    # DATE FIELDS
+    st.markdown("### 📅 Manufacturing & Expiry Dates")
+    col_mfg, col_exp = st.columns(2)
+    
+    with col_mfg:
+        mfg_date = st.date_input("Manufacturing Date *", value=None, format="YYYY-MM-DD")
+    with col_exp:
+        exp_date = st.date_input("Expiry Date *", value=None, format="YYYY-MM-DD")
+    
+    # Validate dates
+    if mfg_date and exp_date:
+        errors = validate_dates(mfg_date.strftime("%Y-%m-%d"), exp_date.strftime("%Y-%m-%d"))
+        if errors:
+            for err in errors:
+                st.warning(err)
+        else:
+            days_to_exp = calculate_days_to_expiry(exp_date.strftime("%Y-%m-%d"))
+            status, color = get_expiry_status(days_to_exp)
+            st.info(f"Status: {status} | Days to Expiry: {days_to_exp}")
+        
     if st.button("Save Stock", type="primary"):
         if not brand_name or not actual_item:
             st.error("Item and Brand Name are required.")
+        elif not mfg_date or not exp_date:
+            st.error("Manufacturing Date and Expiry Date are required.")
         else:
-            open_bottles = 0
-            closed_bottles = bottle_count
-            open_ml = 0.0
-            total_ml_available = bottle_count * ml_per_bottle
-            
-            run_query("INSERT OR IGNORE INTO BRAND_MASTER (brand_name, standard_ml, category) VALUES (?, ?, ?)", 
-                      (brand_name.strip(), ml_per_bottle, actual_item.strip()))
-            
-            query = '''
-                INSERT INTO STOCK_TABLE 
-                (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                 closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            '''
-            success = run_query(query, (
-                date_added.strftime("%Y-%m-%d"), brand_name.strip(), actual_item.strip(), ml_per_bottle, 
-                bottle_count, open_bottles, closed_bottles, open_ml, total_ml_available, 
-                "", price, supplier.strip(), remarks.strip(), location
-            ))
-            if success:
-                st.success(f"Successfully added {bottle_count} bottles of {brand_name} ({actual_item}) to {location}.")
-
-def request_stock_addition():
-    st.title("📝 Request Stock Addition")
-    st.info("Submit a request for new stock. An Admin will review and approve it.")
-    
-    locations = get_active_locations()
-    
-    col_loc, col_date = st.columns(2)
-    with col_loc:
-        location = st.selectbox("Location *", locations)
-    with col_date:
-        date_added = st.date_input("Date", datetime.today())
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        item_options = ["Whiskey", "Vodka", "Beer", "Rum", "Wine", "Gin", "Tequila", "Brandy", "Champagne", "Others"]
-        selected_item = st.selectbox("Item *", item_options)
-        
-        if selected_item == "Others":
-            actual_item = st.text_input("Specify Item *")
-        else:
-            actual_item = selected_item
-            
-        brand_name = st.text_input("Brand Name *")
-        price = st.number_input("Price", min_value=0.0, step=10.0)
-        bottle_count = st.number_input("Bottle Count *", min_value=1, value=1, step=1)
-        
-    with col2:
-        ml_per_bottle = st.number_input("ML per Bottle *", min_value=1.0, value=750.0, step=50.0)
-        supplier = st.text_input("Supplier")
-        remarks = st.text_area("Remarks")
-        
-    if st.button("Send Request", type="primary"):
-        if not brand_name or not actual_item:
-            st.error("Item and Brand Name are required.")
-        else:
-            query = '''
-                INSERT INTO PENDING_STOCK_TABLE 
-                (item, brand_name, bottle_count, ml_per_bottle, price, supplier, remarks, status, requested_by, date, location)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            '''
-            success = run_query(query, (
-                actual_item.strip(), brand_name.strip(), bottle_count, ml_per_bottle, price, 
-                supplier.strip(), remarks.strip(), 'pending', 'Normal User', date_added.strftime("%Y-%m-%d"), location
-            ))
-            if success:
-                st.success("✅ Request sent for admin approval!")
-
-def approve_requests():
-    st.title("✅ Approve Stock Requests")
-    
-    pending_df = fetch_data("SELECT * FROM PENDING_STOCK_TABLE WHERE status='pending'")
-    
-    if pending_df.empty:
-        st.info("No pending stock requests at this time.")
-        return
-        
-    for index, row in pending_df.iterrows():
-        with st.expander(f"Request #{row['request_id']} | {row['location']} | {row['bottle_count']}x {row['brand_name']} ({row['item']})", expanded=True):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write(f"**Location:** {row['location']}")
-                st.write(f"**Item:** {row['item']}")
-                st.write(f"**Brand:** {row['brand_name']}")
-                st.write(f"**Bottle Count:** {row['bottle_count']}")
-                st.write(f"**ML per Bottle:** {row['ml_per_bottle']} ML")
-            with col2:
-                st.write(f"**Price:** ₹{row['price']}")
-                st.write(f"**Supplier:** {row['supplier'] if row['supplier'] else 'N/A'}")
-                st.write(f"**Date:** {row['date']}")
-                st.write(f"**Remarks:** {row['remarks'] if row['remarks'] else 'N/A'}")
+            errors = validate_dates(mfg_date.strftime("%Y-%m-%d"), exp_date.strftime("%Y-%m-%d"))
+            if errors:
+                st.error("\n".join(errors))
+            else:
+                open_bottles = 0
+                closed_bottles = bottle_count
+                open_ml = 0.0
+                total_ml_available = bottle_count * ml_per_bottle
                 
-            colA, colB = st.columns([1, 1])
-            with colA:
-                if st.button("Approve", key=f"approve_{row['request_id']}", type="primary", use_container_width=True):
-                    open_bottles = 0
-                    closed_bottles = row['bottle_count']
-                    open_ml = 0.0
-                    total_ml_available = row['bottle_count'] * row['ml_per_bottle']
-                    
-                    run_query("INSERT OR IGNORE INTO BRAND_MASTER (brand_name, standard_ml, category) VALUES (?, ?, ?)", 
-                              (row['brand_name'].strip(), row['ml_per_bottle'], row['item'].strip()))
-                    
-                    stock_query = '''
-                        INSERT INTO STOCK_TABLE 
-                        (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    '''
-                    success = run_query(stock_query, (
-                        row['date'], row['brand_name'].strip(), row['item'].strip(), row['ml_per_bottle'], 
-                        row['bottle_count'], open_bottles, closed_bottles, open_ml, total_ml_available, 
-                        "", row['price'], row['supplier'], row['remarks'], row['location']
-                    ))
-                    
-                    if success:
-                        run_query("DELETE FROM PENDING_STOCK_TABLE WHERE request_id = ?", (row['request_id'],))
-                        st.success(f"Request #{row['request_id']} approved and added to stock.")
-                        st.rerun()
-
-            with colB:
-                if st.button("Reject", key=f"reject_{row['request_id']}", use_container_width=True):
-                    run_query("DELETE FROM PENDING_STOCK_TABLE WHERE request_id = ?", (row['request_id'],))
-                    st.warning(f"Request #{row['request_id']} rejected.")
-                    st.rerun()
+                run_query("INSERT OR IGNORE INTO BRAND_MASTER (brand_name, standard_ml, category) VALUES (?, ?, ?)", 
+                          (brand_name.strip(), ml_per_bottle, actual_item.strip()))
+                
+                query = '''
+                    INSERT INTO STOCK_TABLE 
+                    (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
+                     closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location, mfg_date, expiry_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                '''
+                success = run_query(query, (
+                    date_added.strftime("%Y-%m-%d"), brand_name.strip(), actual_item.strip(), ml_per_bottle, 
+                    bottle_count, open_bottles, closed_bottles, open_ml, total_ml_available, 
+                    "", price, supplier.strip(), remarks.strip(), location, 
+                    mfg_date.strftime("%Y-%m-%d"), exp_date.strftime("%Y-%m-%d")
+                ))
+                if success:
+                    st.success(f"✅ Successfully added {bottle_count} bottles of {brand_name} ({actual_item}) to {location}.\nExpiry: {exp_date.strftime('%Y-%m-%d')}")
 
 def view_stock():
     st.title("📦 View Stock")
     
-    df = fetch_data("SELECT * FROM STOCK_TABLE ORDER BY date_added DESC")
+    df = fetch_data("SELECT * FROM STOCK_TABLE ORDER BY expiry_date ASC, date_added DESC")
     locations = ["All Locations"] + get_active_locations()
     
     if df.empty:
         st.info("No stock data found.")
         return
+    
+    # Calculate expiry info
+    df['days_to_expiry'] = df['expiry_date'].apply(calculate_days_to_expiry)
+    df['expiry_status'] = df['days_to_expiry'].apply(lambda x: get_expiry_status(x)[0])
         
-    col_loc, col_brand, col_search = st.columns(3)
+    col_loc, col_brand, col_status = st.columns(3)
     with col_loc:
         filter_loc = st.selectbox("Filter by Location", locations)
     with col_brand:
-        brands = ["All"] + df['brand_name'].unique().tolist()
+        brands = ["All"] + sorted(df['brand_name'].unique().tolist())
         filter_brand = st.selectbox("Filter by Brand", brands)
-    with col_search:
-        search = st.text_input("Search (Item, Supplier)")
+    with col_status:
+        statuses = ["All", "🟢 GOOD", "🟡 EXPIRING SOON", "🔴 CRITICAL", "⚫ EXPIRED"]
+        filter_status = st.selectbox("Filter by Expiry Status", statuses)
         
     if filter_loc != "All Locations":
         df = df[df['location'] == filter_loc]
     if filter_brand != "All":
         df = df[df['brand_name'] == filter_brand]
-    if search:
-        search = search.lower()
-        mask = df.astype(str).apply(lambda x: x.str.lower().str.contains(search)).any(axis=1)
-        df = df[mask]
+    if filter_status != "All":
+        df = df[df['expiry_status'] == filter_status]
         
     df_display = rename_for_display(df)
-    st.dataframe(df_display, use_container_width=True)
+    st.dataframe(df_display, use_container_width=True, height=400)
     
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
@@ -625,7 +699,8 @@ def upload_stock_excel():
                        file_name="stock_template.xlsx", 
                        mime="application/vnd.ms-excel")
                            
-    st.write("Upload an Excel file to bulk add stock. Required columns: `item`, `brand_name`, `location`, `ml_per_bottle`, `bottle_count`, `bill_no`, `date`, `price`, `supplier`, `remarks`")
+    st.write("Upload an Excel file to bulk add stock. Required columns: `item`, `brand_name`, `location`, `ml_per_bottle`, `bottle_count`, `mfg_date`, `expiry_date`, `bill_no`, `date`, `price`, `supplier`, `remarks`")
+    st.info("📌 **Date Format**: YYYY-MM-DD (e.g., 2026-04-08)")
     
     uploaded_file = st.file_uploader("Choose a .xlsx file (Stock)", type=["xlsx"])
     active_locations = get_active_locations()
@@ -646,7 +721,6 @@ def upload_stock_excel():
                         failed_count += 1
                         continue
                         
-                    # Handle location
                     loc_val = str(row.get('location', '')).strip()
                     if not loc_val or pd.isna(loc_val) or loc_val == 'nan' or loc_val not in active_locations:
                         location = default_loc
@@ -661,9 +735,23 @@ def upload_stock_excel():
                     price = float(row.get('price', 0.0)) if pd.notna(row.get('price')) else 0.0
                     supplier = str(row.get('supplier', ''))
                     remarks = str(row.get('remarks', ''))
+                    mfg_date = str(row.get('mfg_date', ''))[:10] if pd.notna(row.get('mfg_date')) else None
+                    expiry_date = str(row.get('expiry_date', ''))[:10] if pd.notna(row.get('expiry_date')) else None
                     
                     if pd.isna(date_val): date_val = datetime.today().strftime("%Y-%m-%d")
                     else: date_val = str(date_val)[:10]
+                    
+                    # Validate dates
+                    if not mfg_date or not expiry_date:
+                        st.warning(f"Row {index + 2}: Skipped - MFG or Expiry date missing.")
+                        failed_count += 1
+                        continue
+                    
+                    errors = validate_dates(mfg_date, expiry_date)
+                    if errors:
+                        st.warning(f"Row {index + 2}: {errors[0]}")
+                        failed_count += 1
+                        continue
 
                     open_bottles = 0
                     closed_bottles = quantity_added
@@ -676,11 +764,11 @@ def upload_stock_excel():
                     query = '''
                         INSERT INTO STOCK_TABLE 
                         (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location, mfg_date, expiry_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     '''
                     if run_query(query, (date_val, brand_name, item_name, ml_per_bottle, quantity_added, 
-                                         open_bottles, closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location)):
+                                         open_bottles, closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location, mfg_date, expiry_date)):
                         success_count += 1
                     else:
                         failed_count += 1
@@ -691,103 +779,9 @@ def upload_stock_excel():
         except Exception as e:
             st.error(f"Error processing file: {e}")
 
-def upload_event_excel():
-    st.title("📁 Upload Event Excel")
-    
-    st.download_button(label="📥 Download Event Template", 
-                       data=get_template_excel('event'), 
-                       file_name="event_template.xlsx", 
-                       mime="application/vnd.ms-excel")
-                           
-    st.write("Upload an Excel file to bulk add events. Required columns: `date`, `occasion`, `brand_name`, `location`, `bottles_consumed`, `extra_ml`, `permit_number`")
-    
-    uploaded_file = st.file_uploader("Choose a .xlsx file (Events)", type=["xlsx"])
-    active_locations = get_active_locations()
-    default_loc = active_locations[0] if active_locations else "Unknown"
-    
-    if uploaded_file is not None:
-        try:
-            df = pd.read_excel(uploaded_file)
-            st.write("📄 File Preview:")
-            st.dataframe(df.head())
-            
-            if st.button("Import Event Data", type="primary"):
-                success_count = 0
-                failed_count = 0
-                
-                for index, row in df.iterrows():
-                    brand_name = str(row.get('brand_name', '')).strip()
-                    
-                    # Handle location
-                    loc_val = str(row.get('location', '')).strip()
-                    if not loc_val or pd.isna(loc_val) or loc_val == 'nan' or loc_val not in active_locations:
-                        location = default_loc
-                    else:
-                        location = loc_val
-                        
-                    bottles_consumed = int(row.get('bottles_consumed', 0)) if pd.notna(row.get('bottles_consumed')) else 0
-                    extra_ml = float(row.get('extra_ml', 0.0)) if pd.notna(row.get('extra_ml')) else 0.0
-                    date_val = row.get('date', datetime.today().strftime("%Y-%m-%d"))
-                    occasion = str(row.get('occasion', ''))
-                    permit_number = str(row.get('permit_number', ''))
-                    
-                    if pd.isna(date_val): date_val = datetime.today().strftime("%Y-%m-%d")
-                    else: date_val = str(date_val)[:10]
-
-                    if not brand_name or brand_name == 'nan':
-                        failed_count += 1
-                        st.warning(f"Row {index + 2}: Skipped due to invalid brand.")
-                        continue
-                        
-                    if bottles_consumed == 0 and extra_ml == 0:
-                        failed_count += 1
-                        st.warning(f"Row {index + 2}: Skipped due to zero consumption.")
-                        continue
-                        
-                    brand_data = fetch_data("SELECT MAX(ml_per_bottle) as max_ml FROM STOCK_TABLE WHERE brand_name = ? AND location = ?", (brand_name, location))
-                    if brand_data.empty or pd.isna(brand_data.iloc[0]['max_ml']):
-                        failed_count += 1
-                        st.error(f"Row {index + 2}: Brand '{brand_name}' not found in current stock for '{location}'.")
-                        continue
-                        
-                    ml_per_bottle = brand_data.iloc[0]['max_ml']
-                    
-                    if extra_ml >= ml_per_bottle:
-                        failed_count += 1
-                        st.error(f"Row {index + 2}: Invalid extra_ml ({extra_ml}) is greater than standard bottle size ({ml_per_bottle}). Adjust bottles_consumed instead.")
-                        continue
-
-                    ml_consumed = (bottles_consumed * ml_per_bottle) + extra_ml
-                        
-                    success, result = apply_consumption_logic(brand_name, location, ml_consumed)
-                    
-                    if success:
-                        stats = result
-                        insert_q = '''
-                            INSERT INTO EVENT_TABLE 
-                            (date, occasion, brand_name, total_bottles_before, total_ml_before, ml_consumed, 
-                             closed_bottles_opened, open_ml_used, total_bottles_after, total_ml_after, 
-                             open_bottles_after, closed_bottles_after, permit_number, location)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        '''
-                        run_query(insert_q, (
-                            date_val, occasion, brand_name, stats['total_bottles_before'], stats['total_ml_before'], 
-                            ml_consumed, stats['closed_bottles_opened'], stats['open_ml_used'], stats['total_bottles_after'], 
-                            stats['total_ml_after'], stats['open_bottles_after'], stats['closed_bottles_after'], permit_number, location
-                        ))
-                        success_count += 1
-                    else:
-                        failed_count += 1
-                        st.error(f"Row {index + 2}: {result}")
-                        
-                st.success(f"✅ Successfully processed {success_count} events!")
-                if failed_count > 0:
-                    st.warning(f"⚠️ Failed to process {failed_count} events.")
-        except Exception as e:
-            st.error(f"Error processing file: {e}")
-
 def create_event():
     st.title("🎉 Create Event (Consumption)")
+    st.info("💡 **FIFO Applied**: Oldest/expiring-soonest stock will be consumed first for automatic inventory rotation.")
     
     locations = get_active_locations()
     location = st.selectbox("Select Location *", locations)
@@ -809,6 +803,15 @@ def create_event():
         total_bottles_before = total_closed_before + total_open_before
         
         st.info(f"📦 **Current Stock available at {location}:** {total_bottles_before} Bottles ({total_closed_before} Sealed, {total_open_before} Open) | {total_ml_before:,.2f} Total ML")
+        
+        # Show FIFO order
+        fifo_df = get_fifo_order(brand, location)
+        fifo_df['days_to_expiry'] = fifo_df['expiry_date'].apply(calculate_days_to_expiry)
+        fifo_df['expiry_status'] = fifo_df['days_to_expiry'].apply(lambda x: get_expiry_status(x)[0])
+        
+        st.markdown("#### 📋 Consumption Order (FIFO):")
+        fifo_display = rename_for_display(fifo_df[['mfg_date', 'expiry_date', 'days_to_expiry', 'expiry_status', 'closed_bottles', 'open_bottles', 'total_ml_available']])
+        st.dataframe(fifo_display, use_container_width=True)
         
         date = st.date_input("Event Date", datetime.today())
         occasion = st.text_input("Occasion / Event Name")
@@ -858,20 +861,84 @@ def create_event():
                         INSERT INTO EVENT_TABLE 
                         (date, occasion, brand_name, total_bottles_before, total_ml_before, ml_consumed, 
                          closed_bottles_opened, open_ml_used, total_bottles_after, total_ml_after, 
-                         open_bottles_after, closed_bottles_after, permit_number, location)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         open_bottles_after, closed_bottles_after, permit_number, location, fifo_note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     '''
                     run_query(insert_q, (
                         date.strftime("%Y-%m-%d"), occasion, brand, stats['total_bottles_before'], stats['total_ml_before'], 
                         total_ml_consumed, stats['closed_bottles_opened'], stats['open_ml_used'], stats['total_bottles_after'], 
-                        stats['total_ml_after'], stats['open_bottles_after'], stats['closed_bottles_after'], permit_number, location
+                        stats['total_ml_after'], stats['open_bottles_after'], stats['closed_bottles_after'], permit_number, location,
+                        stats['fifo_note']
                     ))
                     st.success("✅ Consumption recorded successfully!")
+                    st.info(f"📝 FIFO Details:\n{stats['fifo_note']}")
                 else:
                     st.error(f"Error during consumption: {result}")
 
+def expiry_report():
+    st.title("📊 Expiry & Compliance Report")
+    
+    locations = get_active_locations()
+    filter_loc = st.selectbox("Filter by Location", ["All Locations"] + locations)
+    
+    stock_df = fetch_data("SELECT * FROM STOCK_TABLE")
+    
+    if stock_df.empty:
+        st.info("No stock data.")
+        return
+    
+    stock_df['days_to_expiry'] = stock_df['expiry_date'].apply(calculate_days_to_expiry)
+    stock_df['expiry_status'] = stock_df['days_to_expiry'].apply(lambda x: get_expiry_status(x)[0])
+    
+    if filter_loc != "All Locations":
+        stock_df = stock_df[stock_df['location'] == filter_loc]
+    
+    # Summary Metrics
+    st.markdown("### 📈 Summary Metrics")
+    
+    expired_df = stock_df[stock_df['days_to_expiry'] < 0]
+    critical_df = stock_df[(stock_df['days_to_expiry'] >= 0) & (stock_df['days_to_expiry'] < CRITICAL_EXPIRY_DAYS)]
+    warning_df = stock_df[(stock_df['days_to_expiry'] >= CRITICAL_EXPIRY_DAYS) & (stock_df['days_to_expiry'] < WARNING_EXPIRY_DAYS)]
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Expired", len(expired_df))
+    c2.metric("Critical (< 7 days)", len(critical_df))
+    c3.metric("Warning (7-30 days)", len(warning_df))
+    c4.metric("Total Stock Items", len(stock_df))
+    
+    st.markdown("---")
+    st.markdown("### 🚨 Expired Stock")
+    if not expired_df.empty:
+        exp_display = rename_for_display(expired_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'closed_bottles', 'open_bottles', 'total_ml_available']])
+        st.dataframe(exp_display, use_container_width=True)
+    else:
+        st.success("✅ No expired stock")
+    
+    st.markdown("### 🔴 Critical (Expires in < 7 days)")
+    if not critical_df.empty:
+        crit_display = rename_for_display(critical_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'days_to_expiry', 'closed_bottles', 'open_bottles', 'total_ml_available']])
+        st.dataframe(crit_display, use_container_width=True)
+    else:
+        st.success("✅ No critical expirations")
+    
+    st.markdown("### 🟡 Warning (Expires in 7-30 days)")
+    if not warning_df.empty:
+        warn_display = rename_for_display(warning_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'days_to_expiry', 'closed_bottles', 'open_bottles', 'total_ml_available']])
+        st.dataframe(warn_display, use_container_width=True)
+    else:
+        st.success("✅ No warnings")
+    
+    # Export
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+        expired_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Expired')
+        critical_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Critical')
+        warning_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Warning')
+    
+    st.download_button(label="📥 Download Compliance Report", data=buffer.getvalue(), file_name="expiry_report.xlsx", mime="application/vnd.ms-excel")
+
 def event_history():
-    st.title("📜 Event History")
+    st.title("📜 Event History (with FIFO Notes)")
     
     df = fetch_data("SELECT * FROM EVENT_TABLE ORDER BY event_id DESC")
     locations = ["All Locations"] + get_active_locations()
@@ -922,6 +989,7 @@ def brand_summary():
             brand_name, 
             location,
             MAX(ml_per_bottle) as ml_per_bottle,
+            MIN(expiry_date) as earliest_expiry,
             SUM(quantity_added) as total_bottles_added,
             SUM(closed_bottles) as current_closed_bottles,
             SUM(open_bottles) as current_open_bottles,
@@ -936,13 +1004,17 @@ def brand_summary():
     if df.empty:
         st.info("No data available.")
         return
-        
+    
+    df['days_to_expiry'] = df['earliest_expiry'].apply(calculate_days_to_expiry)
     df['total_current_bottles'] = df['current_closed_bottles'] + df['current_open_bottles']
+    df['expiry_status'] = df['days_to_expiry'].apply(lambda x: get_expiry_status(x)[0])
     
     summary_mapping = {
         'brand_name': 'Brand Name',
         'location': 'Location',
         'ml_per_bottle': 'ML per Bottle',
+        'earliest_expiry': 'Earliest Expiry',
+        'expiry_status': 'Status',
         'total_bottles_added': 'Total Bottles Added',
         'current_closed_bottles': 'Sealed Bottles',
         'current_open_bottles': 'Open Bottles',
@@ -952,6 +1024,130 @@ def brand_summary():
     }
     df_display = df.rename(columns=summary_mapping)
     st.dataframe(df_display, use_container_width=True)
+
+def request_stock_addition():
+    st.title("📝 Request Stock Addition")
+    st.info("Submit a request for new stock. Include MFG and Expiry dates for compliance.")
+    
+    locations = get_active_locations()
+    
+    col_loc, col_date = st.columns(2)
+    with col_loc:
+        location = st.selectbox("Location *", locations)
+    with col_date:
+        date_added = st.date_input("Date", datetime.today())
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        item_options = ["Whiskey", "Vodka", "Beer", "Rum", "Wine", "Gin", "Tequila", "Brandy", "Champagne", "Others"]
+        selected_item = st.selectbox("Item *", item_options)
+        
+        if selected_item == "Others":
+            actual_item = st.text_input("Specify Item *")
+        else:
+            actual_item = selected_item
+            
+        brand_name = st.text_input("Brand Name *")
+        price = st.number_input("Price", min_value=0.0, step=10.0)
+        bottle_count = st.number_input("Bottle Count *", min_value=1, value=1, step=1)
+        
+    with col2:
+        ml_per_bottle = st.number_input("ML per Bottle *", min_value=1.0, value=750.0, step=50.0)
+        supplier = st.text_input("Supplier")
+        remarks = st.text_area("Remarks")
+    
+    st.markdown("### 📅 Manufacturing & Expiry Dates")
+    col_mfg, col_exp = st.columns(2)
+    
+    with col_mfg:
+        mfg_date = st.date_input("Manufacturing Date *", value=None, format="YYYY-MM-DD")
+    with col_exp:
+        exp_date = st.date_input("Expiry Date *", value=None, format="YYYY-MM-DD")
+        
+    if st.button("Send Request", type="primary"):
+        if not brand_name or not actual_item:
+            st.error("Item and Brand Name are required.")
+        elif not mfg_date or not exp_date:
+            st.error("Manufacturing Date and Expiry Date are required.")
+        else:
+            errors = validate_dates(mfg_date.strftime("%Y-%m-%d"), exp_date.strftime("%Y-%m-%d"))
+            if errors:
+                st.error("\n".join(errors))
+            else:
+                query = '''
+                    INSERT INTO PENDING_STOCK_TABLE 
+                    (item, brand_name, bottle_count, ml_per_bottle, price, supplier, remarks, status, requested_by, date, location, mfg_date, expiry_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                '''
+                success = run_query(query, (
+                    actual_item.strip(), brand_name.strip(), bottle_count, ml_per_bottle, price, 
+                    supplier.strip(), remarks.strip(), 'pending', 'Normal User', date_added.strftime("%Y-%m-%d"), location,
+                    mfg_date.strftime("%Y-%m-%d"), exp_date.strftime("%Y-%m-%d")
+                ))
+                if success:
+                    st.success("✅ Request sent for admin approval!")
+
+def approve_requests():
+    st.title("✅ Approve Stock Requests")
+    
+    pending_df = fetch_data("SELECT * FROM PENDING_STOCK_TABLE WHERE status='pending'")
+    
+    if pending_df.empty:
+        st.info("No pending stock requests at this time.")
+        return
+        
+    for index, row in pending_df.iterrows():
+        with st.expander(f"Request #{row['request_id']} | {row['location']} | {row['bottle_count']}x {row['brand_name']} ({row['item']})", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Location:** {row['location']}")
+                st.write(f"**Item:** {row['item']}")
+                st.write(f"**Brand:** {row['brand_name']}")
+                st.write(f"**Bottle Count:** {row['bottle_count']}")
+                st.write(f"**ML per Bottle:** {row['ml_per_bottle']} ML")
+            with col2:
+                st.write(f"**Price:** ₹{row['price']}")
+                st.write(f"**Supplier:** {row['supplier'] if row['supplier'] else 'N/A'}")
+                st.write(f"**Date:** {row['date']}")
+                st.write(f"**MFG Date:** {row['mfg_date'] if row['mfg_date'] else 'N/A'}")
+                st.write(f"**Expiry Date:** {row['expiry_date'] if row['expiry_date'] else 'N/A'}")
+                st.write(f"**Remarks:** {row['remarks'] if row['remarks'] else 'N/A'}")
+                
+            colA, colB = st.columns([1, 1])
+            with colA:
+                if st.button("Approve", key=f"approve_{row['request_id']}", type="primary", use_container_width=True):
+                    open_bottles = 0
+                    closed_bottles = row['bottle_count']
+                    open_ml = 0.0
+                    total_ml_available = row['bottle_count'] * row['ml_per_bottle']
+                    
+                    run_query("INSERT OR IGNORE INTO BRAND_MASTER (brand_name, standard_ml, category) VALUES (?, ?, ?)", 
+                              (row['brand_name'].strip(), row['ml_per_bottle'], row['item'].strip()))
+                    
+                    stock_query = '''
+                        INSERT INTO STOCK_TABLE 
+                        (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
+                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location, mfg_date, expiry_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    '''
+                    success = run_query(stock_query, (
+                        row['date'], row['brand_name'].strip(), row['item'].strip(), row['ml_per_bottle'], 
+                        row['bottle_count'], open_bottles, closed_bottles, open_ml, total_ml_available, 
+                        "", row['price'], row['supplier'], row['remarks'], row['location'],
+                        row['mfg_date'], row['expiry_date']
+                    ))
+                    
+                    if success:
+                        run_query("DELETE FROM PENDING_STOCK_TABLE WHERE request_id = ?", (row['request_id'],))
+                        st.success(f"Request #{row['request_id']} approved and added to stock.")
+                        st.rerun()
+
+            with colB:
+                if st.button("Reject", key=f"reject_{row['request_id']}", use_container_width=True):
+                    run_query("DELETE FROM PENDING_STOCK_TABLE WHERE request_id = ?", (row['request_id'],))
+                    st.warning(f"Request #{row['request_id']} rejected.")
+                    st.rerun()
 
 def edit_delete_data():
     st.title("⚙️ Edit / Delete Data")
@@ -1009,11 +1205,9 @@ def main():
     st.set_page_config(page_title="Liquor Inventory Tracker", page_icon="🍷", layout="wide")
     init_db()
     
-    # Initialize session state for Role-Based Access
     if 'user_role' not in st.session_state:
         st.session_state['user_role'] = None
 
-    # LOGIN SCREEN
     if st.session_state['user_role'] is None:
         st.title("🍷 Liquor Inventory System")
         st.markdown("---")
@@ -1039,7 +1233,6 @@ def main():
                     st.error("Invalid Admin Credentials")
         return
 
-    # SIDEBAR NAVIGATION
     st.sidebar.title("🍷 Liquor Tracker")
     st.sidebar.write(f"Logged in as: **{st.session_state['user_role'].title()}**")
     
@@ -1061,9 +1254,9 @@ def main():
             "Add Stock", 
             "View Stock", 
             "Upload Stock Excel", 
-            "Upload Event Excel",
             "Create Event", 
-            "Event History", 
+            "Event History",
+            "Expiry & Compliance Report",
             "Brand Summary", 
             "Approve Requests",
             "Edit / Delete Data"
@@ -1078,7 +1271,6 @@ def main():
         
     choice = st.sidebar.radio("Navigation", menu)
     
-    # ROUTING
     if choice == "Dashboard":
         dashboard()
     elif choice == "Manage Locations":
@@ -1089,12 +1281,12 @@ def main():
         view_stock()
     elif choice == "Upload Stock Excel":
         upload_stock_excel()
-    elif choice == "Upload Event Excel":
-        upload_event_excel()
     elif choice == "Create Event":
         create_event()
     elif choice == "Event History":
         event_history()
+    elif choice == "Expiry & Compliance Report":
+        expiry_report()
     elif choice == "Brand Summary":
         brand_summary()
     elif choice == "Edit / Delete Data":
