@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 import io
+import time
 
 # ==========================================
 # CONFIG & CREDENTIALS
@@ -17,6 +18,9 @@ ADMIN_PASS = "amittpddl"
 CRITICAL_EXPIRY_DAYS = 7      # Red alert
 WARNING_EXPIRY_DAYS = 30      # Yellow alert
 SAFE_EXPIRY_DAYS = 90         # Green status
+
+# Item types
+ITEM_TYPES = ["Whiskey", "Vodka", "Beer", "Rum", "Wine", "Gin", "Tequila", "Brandy", "Champagne", "Others"]
 
 # ==========================================
 # DATABASE SETUP & HELPERS
@@ -39,9 +43,11 @@ def init_db():
         )
     ''')
     
-    # Insert Default Locations if empty
-    c.execute("INSERT OR IGNORE INTO LOCATIONS_TABLE (location_name) VALUES ('Cenpeid Guest House')")
-    c.execute("INSERT OR IGNORE INTO LOCATIONS_TABLE (location_name) VALUES ('Civil Lines Guest House')")
+    # Insert Default Locations ONLY if table is empty
+    location_count = c.execute("SELECT COUNT(*) FROM LOCATIONS_TABLE").fetchone()[0]
+    if location_count == 0:
+        c.execute("INSERT INTO LOCATIONS_TABLE (location_name) VALUES ('Cenpeid Guest House')")
+        c.execute("INSERT INTO LOCATIONS_TABLE (location_name) VALUES ('Civil Lines Guest House')")
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS STOCK_TABLE (
@@ -181,13 +187,31 @@ def get_active_locations():
 def get_template_excel(template_type):
     buffer = io.BytesIO()
     if template_type == 'stock':
-        df = pd.DataFrame(columns=['item', 'brand_name', 'location', 'ml_per_bottle', 'bottle_count', 
-                                   'mfg_date', 'expiry_date', 'bill_no', 'date', 'price', 'supplier', 'remarks'])
+        # Updated columns to match the required structure
+        df = pd.DataFrame(columns=[
+            'Date Added',
+            'Brand Name',
+            'Item',
+            'ML per Bottle',
+            'Bottle Count',
+            'Open Bottles',
+            'Sealed Bottles',
+            'open_ml',
+            'Total ML',
+            'Bill No',
+            'Price',
+            'Supplier',
+            'Remarks',
+            'Location',
+            'MFG Date',
+            'Expiry Date'
+        ])
     elif template_type == 'event':
         df = pd.DataFrame(columns=['date', 'occasion', 'brand_name', 'location', 'bottles_consumed', 'extra_ml', 'permit_number'])
     
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Template')
+    buffer.seek(0)
     return buffer.getvalue()
 
 # ==========================================
@@ -413,12 +437,29 @@ def apply_consumption_logic(brand, location, ml_consumed):
         conn.close()
 
 # ==========================================
+# EVENT DELETION FUNCTION
+# ==========================================
+
+def delete_event(event_id):
+    """Delete a specific event by event_id."""
+    try:
+        result = run_query("DELETE FROM EVENT_TABLE WHERE event_id = ?", (event_id,))
+        return result
+    except Exception as e:
+        st.error(f"Error deleting event: {e}")
+        return False
+
+# ==========================================
 # PAGE FUNCTIONS
 # ==========================================
 
 def manage_locations():
     st.title("📍 Manage Locations")
     st.info("Dynamically add or remove locations. You cannot delete a location if it currently holds stock.")
+    
+    # Initialize session state for deletion confirmation
+    if 'pending_delete_location' not in st.session_state:
+        st.session_state['pending_delete_location'] = None
     
     locations = get_active_locations()
     
@@ -433,30 +474,95 @@ def manage_locations():
                     c = conn.cursor()
                     c.execute("INSERT INTO LOCATIONS_TABLE (location_name) VALUES (?)", (clean_name,))
                     conn.commit()
-                    st.success(f"Added location: {clean_name}")
+                    st.success(f"✅ Added location: {clean_name}")
                     st.rerun()
                 except sqlite3.IntegrityError:
-                    st.error("This location name already exists.")
+                    st.error("❌ This location name already exists.")
                 finally:
                     conn.close()
             else:
-                st.error("Location name cannot be empty.")
+                st.error("❌ Location name cannot be empty.")
                 
     st.markdown("---")
     st.subheader("Active Locations")
     
+    if not locations:
+        st.info("No locations added yet.")
+        return
+    
+    # Display each location with stock info and delete button
     for loc in locations:
-        col1, col2 = st.columns([3, 1])
-        col1.write(f"🏢 **{loc}**")
+        # Check if location has stock
+        stock_check = fetch_data(
+            "SELECT COUNT(*) as count FROM STOCK_TABLE WHERE location = ?", 
+            (loc,)
+        )
+        has_stock = stock_check.iloc[0]['count'] > 0 if not stock_check.empty else False
         
-        if col2.button("Delete", key=f"del_{loc}", use_container_width=True):
-            stock_check = fetch_data("SELECT COUNT(*) as count FROM STOCK_TABLE WHERE location = ?", (loc,))
-            if stock_check.iloc[0]['count'] > 0:
-                st.error(f"Cannot delete '{loc}' because it has active stock entries. Please clear stock first.")
+        col_name, col_stock, col_delete = st.columns([2, 1, 1])
+        
+        with col_name:
+            st.write(f"🏢 **{loc}**")
+        
+        with col_stock:
+            if has_stock:
+                st.caption(f"📦 {stock_check.iloc[0]['count']} items")
             else:
-                run_query("DELETE FROM LOCATIONS_TABLE WHERE location_name = ?", (loc,))
-                st.success(f"Deleted location: {loc}")
-                st.rerun()
+                st.caption("✅ Empty")
+        
+        with col_delete:
+            if has_stock:
+                st.button(
+                    "🔒 Can't Delete",
+                    key=f"locked_{loc}",
+                    disabled=True,
+                    use_container_width=True,
+                    help="This location has active stock"
+                )
+            else:
+                if st.button("🗑️ Delete", key=f"del_{loc}", use_container_width=True):
+                    st.session_state['pending_delete_location'] = loc
+    
+    st.markdown("---")
+    
+    # Handle deletion with confirmation
+    if st.session_state['pending_delete_location']:
+        loc_to_delete = st.session_state['pending_delete_location']
+        
+        # Double check - location should be empty
+        stock_check = fetch_data(
+            "SELECT COUNT(*) as count FROM STOCK_TABLE WHERE location = ?", 
+            (loc_to_delete,)
+        )
+        has_stock = stock_check.iloc[0]['count'] > 0 if not stock_check.empty else False
+        
+        if has_stock:
+            st.error(f"❌ Cannot delete '{loc_to_delete}' - it has active stock!")
+            st.session_state['pending_delete_location'] = None
+        else:
+            st.warning(f"⚠️ **Confirm Deletion of '{loc_to_delete}'**")
+            col_yes, col_no = st.columns(2)
+            
+            with col_yes:
+                if st.button("✅ Yes, Delete Location", type="primary", use_container_width=True, key="confirm_del_yes"):
+                    try:
+                        conn = get_connection()
+                        c = conn.cursor()
+                        c.execute("DELETE FROM LOCATIONS_TABLE WHERE location_name = ?", (loc_to_delete,))
+                        conn.commit()
+                        conn.close()
+                        st.success(f"✅ Location '{loc_to_delete}' deleted successfully!")
+                        st.session_state['pending_delete_location'] = None
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Error deleting location: {e}")
+                        st.session_state['pending_delete_location'] = None
+            
+            with col_no:
+                if st.button("❌ Cancel", use_container_width=True, key="confirm_del_no"):
+                    st.session_state['pending_delete_location'] = None
+                    st.rerun()
 
 def dashboard():
     st.title("📊 Dashboard & Expiry Alerts")
@@ -552,8 +658,11 @@ def dashboard():
         
         with colA:
             brand_stock = loc_stock[loc_stock['days_to_expiry'] >= 0].groupby('brand_name')['total_ml_available'].sum().reset_index()
-            fig_pie = px.pie(brand_stock, names='brand_name', values='total_ml_available', hole=0.3, title="Stock by Brand")
-            st.plotly_chart(fig_pie, use_container_width=True)
+            if not brand_stock.empty:
+                fig_pie = px.pie(brand_stock, names='brand_name', values='total_ml_available', hole=0.3, title="Stock by Brand")
+                st.plotly_chart(fig_pie, use_container_width=True)
+            else:
+                st.write("No stock data available for this location.")
             
         with colB:
             loc_events = events_df[events_df['location'] == loc] if not events_df.empty else pd.DataFrame()
@@ -582,8 +691,7 @@ def add_stock():
     col1, col2 = st.columns(2)
     
     with col1:
-        item_options = ["Whiskey", "Vodka", "Beer", "Rum", "Wine", "Gin", "Tequila", "Brandy", "Champagne", "Others"]
-        selected_item = st.selectbox("Item *", item_options)
+        selected_item = st.selectbox("Item Type *", ITEM_TYPES)
         
         if selected_item == "Others":
             actual_item = st.text_input("Specify Item *")
@@ -666,20 +774,20 @@ def view_stock():
     df['days_to_expiry'] = df['expiry_date'].apply(calculate_days_to_expiry)
     df['expiry_status'] = df['days_to_expiry'].apply(lambda x: get_expiry_status(x)[0])
         
-    col_loc, col_brand, col_status = st.columns(3)
+    col_loc, col_item, col_status = st.columns(3)
     with col_loc:
         filter_loc = st.selectbox("Filter by Location", locations)
-    with col_brand:
-        brands = ["All"] + sorted(df['brand_name'].unique().tolist())
-        filter_brand = st.selectbox("Filter by Brand", brands)
+    with col_item:
+        item_types = ["All"] + sorted(df['item_name'].unique().tolist())
+        filter_item = st.selectbox("Filter by Item Type", item_types)
     with col_status:
         statuses = ["All", "🟢 GOOD", "🟡 EXPIRING SOON", "🔴 CRITICAL", "⚫ EXPIRED"]
         filter_status = st.selectbox("Filter by Expiry Status", statuses)
         
     if filter_loc != "All Locations":
         df = df[df['location'] == filter_loc]
-    if filter_brand != "All":
-        df = df[df['brand_name'] == filter_brand]
+    if filter_item != "All":
+        df = df[df['item_name'] == filter_item]
     if filter_status != "All":
         df = df[df['expiry_status'] == filter_status]
         
@@ -694,90 +802,129 @@ def view_stock():
 def upload_stock_excel():
     st.title("📁 Upload Stock Excel")
     
-    st.download_button(label="📥 Download Stock Template", 
-                       data=get_template_excel('stock'), 
-                       file_name="stock_template.xlsx", 
-                       mime="application/vnd.ms-excel")
-                           
-    st.write("Upload an Excel file to bulk add stock. Required columns: `item`, `brand_name`, `location`, `ml_per_bottle`, `bottle_count`, `mfg_date`, `expiry_date`, `bill_no`, `date`, `price`, `supplier`, `remarks`")
+    st.download_button(
+        label="📥 Download Stock Template", 
+        data=get_template_excel('stock'), 
+        file_name="stock_template.xlsx", 
+        mime="application/vnd.ms-excel"
+    )
+    
+    st.write("Upload an Excel file to bulk add stock.")
+    st.info("📋 **Required Columns**: Date Added, Brand Name, Item, ML per Bottle, Bottle Count, Open Bottles, Sealed Bottles, open_ml, Total ML, Bill No, Price, Supplier, Remarks, Location, MFG Date, Expiry Date")
     st.info("📌 **Date Format**: YYYY-MM-DD (e.g., 2026-04-08)")
     
     uploaded_file = st.file_uploader("Choose a .xlsx file (Stock)", type=["xlsx"])
     active_locations = get_active_locations()
-    default_loc = active_locations[0] if active_locations else "Unknown"
+    default_loc = active_locations[0] if active_locations else "Cenpeid Guest House"
     
     if uploaded_file is not None:
         try:
             df = pd.read_excel(uploaded_file)
             st.write("📄 File Preview:")
-            st.dataframe(df.head())
+            st.dataframe(df.head(10))
+            
+            # Validate required columns
+            required_columns = [
+                'Date Added', 'Brand Name', 'Item', 'ML per Bottle', 'Bottle Count',
+                'Open Bottles', 'Sealed Bottles', 'open_ml', 'Total ML', 'Bill No',
+                'Price', 'Supplier', 'Remarks', 'Location', 'MFG Date', 'Expiry Date'
+            ]
+            
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                st.error(f"❌ Missing required columns: {', '.join(missing_columns)}")
+                st.info(f"📋 Expected columns: {', '.join(required_columns)}")
+                return
             
             if st.button("Import Stock Data", type="primary"):
                 success_count = 0
                 failed_count = 0
+                errors_log = []
+                
                 for index, row in df.iterrows():
-                    brand_name = str(row.get('brand_name', '')).strip()
-                    if not brand_name or pd.isna(brand_name) or brand_name == 'nan':
-                        failed_count += 1
-                        continue
+                    try:
+                        # Extract values from columns
+                        date_added = str(row['Date Added'])[:10] if pd.notna(row['Date Added']) else datetime.today().strftime("%Y-%m-%d")
+                        brand_name = str(row['Brand Name']).strip() if pd.notna(row['Brand Name']) else None
+                        item_name = str(row['Item']).strip() if pd.notna(row['Item']) else None
+                        ml_per_bottle = float(row['ML per Bottle']) if pd.notna(row['ML per Bottle']) else 750.0
+                        bottle_count = int(row['Bottle Count']) if pd.notna(row['Bottle Count']) else 1
+                        open_bottles = int(row['Open Bottles']) if pd.notna(row['Open Bottles']) else 0
+                        sealed_bottles = int(row['Sealed Bottles']) if pd.notna(row['Sealed Bottles']) else bottle_count
+                        open_ml = float(row['open_ml']) if pd.notna(row['open_ml']) else 0.0
+                        total_ml = float(row['Total ML']) if pd.notna(row['Total ML']) else (sealed_bottles * ml_per_bottle) + open_ml
+                        bill_no = str(row['Bill No']).strip() if pd.notna(row['Bill No']) else ""
+                        price = float(row['Price']) if pd.notna(row['Price']) else 0.0
+                        supplier = str(row['Supplier']).strip() if pd.notna(row['Supplier']) else ""
+                        remarks = str(row['Remarks']).strip() if pd.notna(row['Remarks']) else ""
                         
-                    loc_val = str(row.get('location', '')).strip()
-                    if not loc_val or pd.isna(loc_val) or loc_val == 'nan' or loc_val not in active_locations:
-                        location = default_loc
-                    else:
-                        location = loc_val
-
-                    item_name = str(row.get('item', ''))
-                    ml_per_bottle = float(row.get('ml_per_bottle', 750.0)) if pd.notna(row.get('ml_per_bottle')) else 750.0
-                    quantity_added = int(row.get('bottle_count', 1)) if pd.notna(row.get('bottle_count')) else 1
-                    bill_no = str(row.get('bill_no', ''))
-                    date_val = row.get('date', datetime.today().strftime("%Y-%m-%d"))
-                    price = float(row.get('price', 0.0)) if pd.notna(row.get('price')) else 0.0
-                    supplier = str(row.get('supplier', ''))
-                    remarks = str(row.get('remarks', ''))
-                    mfg_date = str(row.get('mfg_date', ''))[:10] if pd.notna(row.get('mfg_date')) else None
-                    expiry_date = str(row.get('expiry_date', ''))[:10] if pd.notna(row.get('expiry_date')) else None
+                        location = str(row['Location']).strip() if pd.notna(row['Location']) else default_loc
+                        if location not in active_locations:
+                            location = default_loc
+                        
+                        mfg_date = str(row['MFG Date'])[:10] if pd.notna(row['MFG Date']) else None
+                        expiry_date = str(row['Expiry Date'])[:10] if pd.notna(row['Expiry Date']) else None
+                        
+                        # Validation
+                        if not brand_name or not item_name:
+                            errors_log.append(f"Row {index + 2}: Brand Name or Item missing")
+                            failed_count += 1
+                            continue
+                        
+                        if not mfg_date or not expiry_date:
+                            errors_log.append(f"Row {index + 2}: MFG Date or Expiry Date missing")
+                            failed_count += 1
+                            continue
+                        
+                        # Validate dates
+                        date_errors = validate_dates(mfg_date, expiry_date)
+                        if date_errors:
+                            errors_log.append(f"Row {index + 2}: {date_errors[0]}")
+                            failed_count += 1
+                            continue
+                        
+                        # Add to BRAND_MASTER
+                        run_query(
+                            "INSERT OR IGNORE INTO BRAND_MASTER (brand_name, standard_ml, category) VALUES (?, ?, ?)",
+                            (brand_name, ml_per_bottle, item_name)
+                        )
+                        
+                        # Insert into STOCK_TABLE
+                        query = '''
+                            INSERT INTO STOCK_TABLE 
+                            (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
+                             closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, 
+                             location, mfg_date, expiry_date)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        '''
+                        
+                        if run_query(query, (
+                            date_added, brand_name, item_name, ml_per_bottle, bottle_count,
+                            open_bottles, sealed_bottles, open_ml, total_ml, bill_no, price,
+                            supplier, remarks, location, mfg_date, expiry_date
+                        )):
+                            success_count += 1
+                        else:
+                            failed_count += 1
                     
-                    if pd.isna(date_val): date_val = datetime.today().strftime("%Y-%m-%d")
-                    else: date_val = str(date_val)[:10]
-                    
-                    # Validate dates
-                    if not mfg_date or not expiry_date:
-                        st.warning(f"Row {index + 2}: Skipped - MFG or Expiry date missing.")
-                        failed_count += 1
-                        continue
-                    
-                    errors = validate_dates(mfg_date, expiry_date)
-                    if errors:
-                        st.warning(f"Row {index + 2}: {errors[0]}")
-                        failed_count += 1
-                        continue
-
-                    open_bottles = 0
-                    closed_bottles = quantity_added
-                    open_ml = 0.0
-                    total_ml_available = quantity_added * ml_per_bottle
-                    
-                    run_query("INSERT OR IGNORE INTO BRAND_MASTER (brand_name, standard_ml, category) VALUES (?, ?, ?)", 
-                          (brand_name, ml_per_bottle, item_name))
-                          
-                    query = '''
-                        INSERT INTO STOCK_TABLE 
-                        (date_added, brand_name, item_name, ml_per_bottle, quantity_added, open_bottles, 
-                         closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location, mfg_date, expiry_date)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    '''
-                    if run_query(query, (date_val, brand_name, item_name, ml_per_bottle, quantity_added, 
-                                         open_bottles, closed_bottles, open_ml, total_ml_available, bill_no, price, supplier, remarks, location, mfg_date, expiry_date)):
-                        success_count += 1
-                    else:
+                    except Exception as e:
+                        errors_log.append(f"Row {index + 2}: {str(e)}")
                         failed_count += 1
                 
+                # Display results
                 st.success(f"✅ Successfully imported {success_count} rows!")
+                
                 if failed_count > 0:
-                    st.warning(f"⚠️ Failed to import {failed_count} rows. Please check data format.")
+                    st.warning(f"⚠️ Failed to import {failed_count} rows")
+                    with st.expander(f"📋 View {len(errors_log)} Errors"):
+                        for error in errors_log[:20]:  # Show first 20 errors
+                            st.write(f"• {error}")
+                        if len(errors_log) > 20:
+                            st.write(f"... and {len(errors_log) - 20} more errors")
+        
         except Exception as e:
-            st.error(f"Error processing file: {e}")
+            st.error(f"❌ Error processing file: {str(e)}")
+            st.info("Please ensure your Excel file has the correct column names and format.")
 
 def create_event():
     st.title("🎉 Create Event (Consumption)")
@@ -931,9 +1078,12 @@ def expiry_report():
     # Export
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        expired_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Expired')
-        critical_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Critical')
-        warning_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Warning')
+        if not expired_df.empty:
+            expired_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Expired')
+        if not critical_df.empty:
+            critical_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Critical')
+        if not warning_df.empty:
+            warning_df[['brand_name', 'location', 'mfg_date', 'expiry_date', 'total_ml_available']].to_excel(writer, index=False, sheet_name='Warning')
     
     st.download_button(label="📥 Download Compliance Report", data=buffer.getvalue(), file_name="expiry_report.xlsx", mime="application/vnd.ms-excel")
 
@@ -963,13 +1113,36 @@ def event_history():
         df = df[df['brand_name'] == filter_brand]
     if filter_occ != "All":
         df = df[df['occasion'] == filter_occ]
+    
+    # Display with delete buttons for admin users
+    if st.session_state.get('user_role') == 'admin':
+        st.warning("⚠️ **Admin Mode**: Delete functionality enabled below")
         
-    df_display = rename_for_display(df)
-    st.dataframe(df_display, use_container_width=True)
+        for index, row in df.iterrows():
+            col_data, col_delete = st.columns([5, 1])
+            
+            with col_data:
+                st.write(f"**Event #{row['event_id']}** | {row['date']} | {row['occasion']} | {row['brand_name']} | {row['location']} | {row['ml_consumed']:.0f}ML")
+            
+            with col_delete:
+                if st.button("🗑️ Delete", key=f"del_event_{row['event_id']}", use_container_width=True):
+                    with st.popover("Confirm Delete"):
+                        st.warning(f"Delete Event #{row['event_id']} from {row['date']}?")
+                        if st.button("Yes, Delete", type="primary", key=f"confirm_del_{row['event_id']}"):
+                            if delete_event(row['event_id']):
+                                st.success(f"✅ Event #{row['event_id']} deleted successfully!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to delete event.")
+    else:
+        # Normal user view (read-only)
+        df_display = rename_for_display(df)
+        st.dataframe(df_display, use_container_width=True)
 
+    # Export button (for both users)
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        df_display.to_excel(writer, index=False, sheet_name='Events')
+        rename_for_display(df).to_excel(writer, index=False, sheet_name='Events')
     st.download_button(label="📥 Download Events as Excel", data=buffer.getvalue(), file_name="event_history.xlsx", mime="application/vnd.ms-excel")
 
 def brand_summary():
@@ -1040,8 +1213,7 @@ def request_stock_addition():
     col1, col2 = st.columns(2)
     
     with col1:
-        item_options = ["Whiskey", "Vodka", "Beer", "Rum", "Wine", "Gin", "Tequila", "Brandy", "Champagne", "Others"]
-        selected_item = st.selectbox("Item *", item_options)
+        selected_item = st.selectbox("Item Type *", ITEM_TYPES)
         
         if selected_item == "Others":
             actual_item = st.text_input("Specify Item *")
